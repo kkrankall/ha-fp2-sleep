@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.5
+
+- The once-per-start history check also samples the past seven nights: one
+  hour ending at 02:00 local time, for heart rate, breathing, sleep state and
+  body movement, logged as one `History check, hour ending …` line per night
+  with entry counts and the values seen. That tells a sensor that never gets a
+  vitals lock (the same value every night) from a bad night. The window is
+  sent as `startTime`/`endTime`; a line says so if Aqara ignores `endTime`.
+  Requests are spaced one second apart.
+
 ## 1.3.4
 
 Adds a one-time check of Aqara's history log, to learn whether readings the

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.5
+
+- The history check also samples an hour of each of the past seven nights
+  (`History check, hour ending …` lines), to tell a sensor that never locks
+  onto heart rate and breathing from a bad night.
+
 ## 1.3.4
 
 - Once per start, the log reports what Aqara's history log holds for the last
