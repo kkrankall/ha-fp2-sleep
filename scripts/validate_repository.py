@@ -3132,7 +3132,7 @@ def check_measurement_time_and_device_status() -> None:
         {"subjectId": "lumi1.0123456789ab", "attr": "heartrate_value", "value": "61", "timeStamp": ms},
         {"subjectId": "lumi1.0123456789ab", "attr": "sleep_state", "value": "4", "timeStamp": str(ms)},
         {"subjectId": "lumi1.0123456789ab", "attr": "set_device_mode4", "value": "9", "timeStamp": ms},
-        {"subjectId": "lumi1.0123456789ab", "attr": "device_offline_status", "value": 0, "timeStamp": ms},
+        {"subjectId": "lumi1.0123456789ab", "attr": "device_offline_status", "value": 1, "timeStamp": ms},
         "not an object",
         {"value": "12"},
         {"attr": 5, "value": "x"},
@@ -3148,7 +3148,7 @@ def check_measurement_time_and_device_status() -> None:
         fail(f"build_state must publish each reading's measured_at: {measured}")
     if measured.get("lux") is not None:
         fail(f"a missing reading has no measured_at: {measured}")
-    if (mode, offline) != ("9", "0"):
+    if (mode, offline) != ("9", "1"):
         fail(f"build_state mode/offline codes: {(mode, offline)}")
     if state.get("device_mode") != "Sleep monitoring" or state.get("fp2_online") != "ON":
         fail(f"build_state device status: {state}")
@@ -3156,7 +3156,7 @@ def check_measurement_time_and_device_status() -> None:
         fail("the state payload must be JSON")
 
     for codes, label, online in (
-        (("3", "1"), "Zone detection", "OFF"),
+        (("3", "0"), "Zone detection", "OFF"),
         (("5", None), "Fall detection", None),
         (("7", "2"), "Unknown (7)", None),
         ((None, None), None, None),
@@ -3170,12 +3170,12 @@ def check_measurement_time_and_device_status() -> None:
         if got["device_mode"] != label or got["fp2_online"] != online:
             fail(f"device status for {codes}: {got['device_mode']!r}, {got['fp2_online']!r}")
 
-    if module.device_status_message("9", "0")[0] != "info":
+    if module.device_status_message("9", "1")[0] != "info":
         fail("Sleep monitoring and online must log at info")
-    if module.device_status_message("3", "0")[0] != "warning":
+    if module.device_status_message("3", "1")[0] != "warning":
         fail("a mode other than Sleep monitoring must log a warning")
-    if module.device_status_message("9", "1")[0] != "warning":
-        fail("an offline FP2 must log a warning")
+    if module.device_status_message("9", "0")[0] != "warning":
+        fail("an offline FP2 (device_offline_status 0) must log a warning")
 
     line = module.describe_reply_fields(items, now=ms / 1000 + 90)
     if "lumi1." in line or "\n" in line:

@@ -75,13 +75,19 @@ SLEEP_OPTIONS = [
 # The FP2's operating mode and offline flag ride along in the same query. The
 # vitals only mean something while the FP2 is online and in Sleep Monitoring
 # mode, so both are published as diagnostic entities. Aqara does not document
-# the codes; this mapping follows the community AqaraPOST Node-RED flow
-# (github.com/sdavides/AqaraPOST-Homeassistant). Unmapped codes are shown raw.
+# the codes. The mode mapping follows the community AqaraPOST Node-RED flow
+# (github.com/sdavides/AqaraPOST-Homeassistant); unmapped modes are shown raw.
+# Despite its name, `device_offline_status` reads 1 while the FP2 is online:
+# a live US FP2 in Sleep monitoring mode reported 1 with heart rate seconds
+# old, last changed when it reconnected after a network restart. AqaraPOST's
+# mapping of that flag is the other way round.
 MODE_ATTR = "set_device_mode4"
 OFFLINE_ATTR = "device_offline_status"
 DEVICE_MODES = {"3": "Zone detection", "5": "Fall detection", "9": "Sleep monitoring"}
 SLEEP_MONITOR_MODE = "9"
-ONLINE_STATES = {"0": "ON", "1": "OFF"}
+ONLINE_CODE = "1"
+OFFLINE_CODE = "0"
+ONLINE_STATES = {ONLINE_CODE: "ON", OFFLINE_CODE: "OFF"}
 
 AREA = os.environ.get("AQARA_AREA", "EU").upper()
 USER = os.environ.get("AQARA_USER", "")
@@ -383,8 +389,10 @@ def discovery_payload(
         # entirely normal operation.
         "force_update": True,
         # force_update also means last_updated only proves the poller is
-        # alive. Aqara stamps each reading with the time it was measured, so
-        # that time rides along as the `measured_at` attribute.
+        # alive. Aqara stamps each reading with the time the FP2 last
+        # reported it, so that time rides along as the `measured_at`
+        # attribute. Heart rate and breathing refresh every few seconds;
+        # sleep_state only when the stage changes.
         "json_attributes_topic": STATE_TOPIC,
         "json_attributes_template": (
             "{{ {'measured_at': (value_json.measured_at | default({})).get('%s')}"
@@ -602,7 +610,7 @@ def describe_reply_fields(items, now=None):
 def device_status_message(mode, offline):
     """(level, text) describing the FP2's mode and online flag."""
     mode_text = describe_mode(mode) or "not reported"
-    if offline == "1":
+    if offline == OFFLINE_CODE:
         return (
             "warning",
             f"Aqara reports the FP2 offline (mode: {mode_text}). Readings stop "
@@ -615,7 +623,7 @@ def device_status_message(mode, offline):
             "breathing and sleep state stay empty or stale until it is switched "
             "back in the Aqara Home app.",
         )
-    online_text = {"0": "online"}.get(offline, "online state not reported")
+    online_text = {ONLINE_CODE: "online"}.get(offline, "online state not reported")
     return "info", f"FP2 mode: {mode_text}; {online_text}."
 
 

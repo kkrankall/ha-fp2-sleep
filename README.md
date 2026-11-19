@@ -60,9 +60,12 @@ SleepRadar creates five MQTT sensors in Home Assistant:
 | `sensor.aqara_fp2_sleep_body_movement` | Body movement value | Sensor-reported measurement |
 | `sensor.aqara_fp2_sleep_illuminance` | Illuminance in lux | Sensor-reported measurement |
 
-Each of the five carries a `measured_at` attribute: the time Aqara says it took
-that reading. A sensor's `last_updated` only shows that SleepRadar polled, so
-use `measured_at` to tell how old a reading is.
+Each of the five carries a `measured_at` attribute: the time the FP2 last
+reported that reading to Aqara. A sensor's `last_updated` only shows that
+SleepRadar polled, so use `measured_at` to tell how old a reading is. Heart
+rate, breathing and body movement refresh every few seconds while someone is
+in bed. Sleep state refreshes only when the stage changes, so its
+`measured_at` shows when the current stage began.
 
 Three diagnostic entities sit alongside them:
 
@@ -72,9 +75,11 @@ Three diagnostic entities sit alongside them:
 | `sensor.aqara_fp2_sleep_fp2_mode` | The FP2's mode: Sleep monitoring, Zone detection or Fall detection. The vitals only mean something in Sleep monitoring |
 | `binary_sensor.aqara_fp2_sleep_fp2_online` | Whether Aqara reports the FP2 online |
 
-The mode and online codes are not documented by Aqara. SleepRadar uses the
-mapping from the community [AqaraPOST](https://github.com/sdavides/AqaraPOST-Homeassistant)
-flow and shows an unmapped mode as `Unknown (code)`.
+The mode and online codes are not documented by Aqara. SleepRadar maps the
+mode with the community [AqaraPOST](https://github.com/sdavides/AqaraPOST-Homeassistant)
+flow and shows an unmapped mode as `Unknown (code)`. Despite its name, Aqara's
+`device_offline_status` reads `1` while the FP2 is online; that was checked
+against a live FP2 whose vitals were seconds old.
 
 ## Before You Start
 
