@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.3
+
+Fixes the FP2 online flag and makes the card's freshness follow live vitals.
+
+- `binary_sensor.aqara_fp2_sleep_fp2_online` showed an online FP2 as
+  offline, and the log warned that it was offline. Aqara's
+  `device_offline_status` reads `1` while the FP2 is online, the opposite of
+  the AqaraPOST mapping 1.3.2 used. A live US FP2 reported `1` while its heart
+  rate was seconds old, and the flag had last changed when the FP2 reconnected
+  after a network restart.
+
+- The card's "Measured … ago" uses the newest `measured_at` of sleep state,
+  heart rate and breathing. Aqara's time is when the FP2 last reported a
+  value: heart rate and breathing refresh every few seconds, but sleep state
+  only when the stage changes, so a stage held for two hours made live vitals
+  read "Measured 2 hr ago".
+
 ## 1.3.2
 
 Readings now carry the time Aqara measured them, Aqara outages no longer

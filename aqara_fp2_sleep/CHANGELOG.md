@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.3
+
+- `binary_sensor.aqara_fp2_sleep_fp2_online` no longer shows an online FP2 as
+  offline: Aqara's `device_offline_status` reads `1` while it is online.
+
+- The card's "Measured … ago" follows the newest of sleep state, heart rate
+  and breathing, so a sleep stage held for hours no longer makes live vitals
+  look old.
+
 ## 1.3.2
 
 Readings now carry the time Aqara measured them, Aqara outages no longer
