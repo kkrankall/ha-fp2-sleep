@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0
+
+- New night totals: hours asleep, light, deep and REM since 18:00, from
+  Aqara's own timestamps (`sensor.aqara_fp2_sleep_night_*`). Exact by
+  morning, unlike time-in-state counts on the delayed live sleep state.
+
 ## 1.3.7
 
 - The history check lists every sleep-stage change of the last 14 hours.

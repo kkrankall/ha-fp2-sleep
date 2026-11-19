@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.4.0
+
+Adds night totals computed from Aqara's own timestamps.
+
+- New sensors `sensor.aqara_fp2_sleep_night_asleep`, `_night_light_sleep`,
+  `_night_deep_sleep` and `_night_rem_sleep`: hours of each sleep stage since
+  18:00 local time, resetting at the next 18:00. Each poll reads the night's
+  stage changes from Aqara's history log; the time from one change to the next
+  counts toward the earlier change's stage.
+
+- Why: Aqara's sleep stage reaches its cloud 7-19 minutes after it happened
+  (the live value carries the event time but arrives late), and Home
+  Assistant records arrival time. A `history_stats` helper on the sleep-state
+  sensor therefore starts and ends late by different amounts; on a real
+  night it overstated sleep by about 19 minutes. These totals use Aqara's
+  event times, so the morning value is exact.
+
+- The latest stage change is not counted until the next change arrives, so a
+  total never runs ahead of what Aqara has confirmed; during a long stage it
+  updates late and then catches up.
+
+- On start, and at each 18:00, the night is read in windows of up to two
+  hours (a full page is split); after that, each poll re-reads the last hour
+  to merge late uploads. One extra history request per poll. A failed read
+  leaves the totals unknown for that poll and never stops polling.
+
 ## 1.3.7
 
 - The history check also lists every sleep-stage change Aqara logged in the
