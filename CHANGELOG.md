@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.6
+
+- The history check then scans heart rate through one whole past night: the
+  night whose breathing varied most in its 02:00 sample (breathing shows the
+  FP2 had a vitals lock), or the most recent one. One hour-long window per
+  hour from 19:00 to 07:00, logged as one `History check, heart rate through
+  the night of …` line with the values and how many times they changed in
+  each hour. Twelve more requests, one second apart.
+
 ## 1.3.5
 
 - The once-per-start history check also samples the past seven nights: one

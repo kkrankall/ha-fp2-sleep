@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.6
+
+- The history check also scans heart rate hour by hour through one past
+  night, to show how often the FP2 updates it.
+
 ## 1.3.5
 
 - The history check also samples an hour of each of the past seven nights
