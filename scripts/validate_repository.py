@@ -3691,6 +3691,57 @@ def check_fp2_firmware() -> None:
         fail(f"a failed firmware read must be logged, not raised: {logged}")
 
 
+def check_device_list_probe() -> None:
+    """The one-time device-list probe logs each candidate endpoint's shape:
+    where the list is, its field names and models, and whether this FP2 is
+    in it, but never an identifier."""
+    module = load_poller_module("poller_device_list_probe")
+    module.HISTORY_REQUEST_GAP_S = 0
+    did = "lumi1.0123456789ab"
+    for res, want in (
+        ({"code": 0, "result": [{"did": did, "model": "lumi.motion.agl001"}, {"did": "lumi.other", "model": "lumi.gateway.acn01"}]},
+         "result: 2 entries, fields did, model; models lumi.gateway.acn01, lumi.motion.agl001; this FP2 listed: yes"),
+        ({"code": 0, "result": {"data": [{"positionId": "real.1", "devices": [{"did": did, "model": "lumi.motion.agl001"}]}]}},
+         "data each devices: 1 entries"),
+        ({"code": 0, "result": {"total": 0}}, "no list (result is a dict; fields: total)"),
+        ({"code": 302, "message": "not found"}, "code 302"),
+    ):
+        line = module.describe_device_list_reply(res, did)
+        if want not in line:
+            fail(f"describe_device_list_reply({res}) = {line!r}, wanted {want!r}")
+        if "0123456789ab" in line or "real.1" in line or "lumi.other" in line:
+            fail(f"the probe must never log identifiers: {line!r}")
+
+    logged, calls = [], []
+    module.log = lambda level, msg: logged.append((level, msg))
+    module.SUBJECT = did
+
+    class Probing:
+        def probe(self, method, path, query="", body_obj=None):
+            calls.append((method, path))
+            if len(calls) == 2:
+                raise OSError("reset")
+            return {"code": 0, "result": [{"did": did, "model": "lumi.motion.agl001"}]}
+
+    module.probe_device_lists(Probing())
+    module.probe_device_lists(object())
+    if len(calls) != len(module.DEVICE_LIST_PROBES):
+        fail(f"every candidate endpoint must be tried once: {calls}")
+    if len(logged) != len(module.DEVICE_LIST_PROBES) or not all(l == "info" for l, _ in logged):
+        fail(f"each probe must log one info line: {logged}")
+    if not any("OSError: reset" in msg for _, msg in logged):
+        fail(f"a failed probe must be logged, not raised: {logged}")
+
+    client = module.Aqara("USA")
+    client.token = "t"
+    sent = []
+    client._send = lambda req: sent.append(req) or {"code": 0, "result": []}
+    client.probe("GET", "/app/v1.0/lumi/app/position/query")
+    client.probe("POST", "/app/v1.0/lumi/app/position/device/query")
+    if [r.get_method() for r in sent] != ["GET", "POST"]:
+        fail(f"probe must send the method it is given: {[r.get_method() for r in sent]}")
+
+
 def check_notification_failure_is_soft() -> None:
     """Losing a notification must never take the poller down."""
     module = load_poller_module("poller_notify_soft")
@@ -5509,6 +5560,7 @@ def main(argv: list[str] | None = None) -> None:
     check_history_check()
     check_night_totals()
     check_fp2_firmware()
+    check_device_list_probe()
     check_notification_failure_is_soft()
     validate_run_script()
     validate_examples()

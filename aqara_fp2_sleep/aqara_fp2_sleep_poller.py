@@ -387,6 +387,13 @@ class Aqara:
         )
         return self._send(req)
 
+    def probe(self, method, path, query="", body_obj=None):
+        """One request to `path` for the device-list probe: GET with an
+        optional query (signed without it), or POST with a JSON body."""
+        if method == "GET":
+            return self._get(path, query, sign_query=False)
+        return self._post(path, body_obj if body_obj is not None else {})
+
     def device_detail(self, did):
         """The device's details (model, firmware, ...) as the Aqara Home app
         reads them. Signed like the AqaraPOST flow (no query string in the
@@ -804,6 +811,77 @@ def firmware_from_detail(res, did):
         if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
             return plain_text(value)[:40], fields
     return None, fields
+
+
+# Candidate endpoints for listing the devices on an account, found in the
+# Aqara Home iOS app. Probed once per start; only the reply's shape is logged.
+DEVICE_LIST_PROBES = (
+    ("GET", "/app/v1.0/lumi/app/dev/query/detail", ""),
+    ("GET", "/app/v1.0/lumi/dev/query/detail", ""),
+    ("GET", "/app/v1.0/lumi/app/position/device/query", ""),
+    ("POST", "/app/v1.0/lumi/app/position/device/query", None),
+    ("GET", "/app/v1.0/lumi/app/position/query", ""),
+)
+
+
+def describe_device_list_reply(res, did):
+    """The shape of a device-list reply: code, where the list is, how many
+    entries, their field names and models, and whether `did` is among them.
+    No identifiers or other values."""
+    code = res.get("code")
+    if code != 0:
+        return f"code {code_text(code)}: {aqara_error_text(res)}"
+    result = res.get("result")
+    found = []
+
+    def walk(node, where, depth):
+        if depth > 4:
+            return
+        if isinstance(node, list):
+            dicts = [item for item in node if isinstance(item, dict)]
+            if dicts:
+                found.append((where or "result", dicts))
+            for item in dicts[:3]:
+                for key, value in item.items():
+                    if isinstance(value, (list, dict)):
+                        walk(value, f"{where} each {key}", depth + 1)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, (list, dict)):
+                    walk(value, f"{where}.{key}" if where else key, depth + 1)
+
+    walk(result, "", 0)
+    if not found:
+        keys = ", ".join(sorted(plain_text(k)[:30] for k in result)) if isinstance(result, dict) else ""
+        return f"no list (result is a {type(result).__name__}{'; fields: ' + keys if keys else ''})"
+    parts = []
+    for where, items in found[:4]:
+        fields = sorted({plain_text(k)[:30] for item in items for k in item})
+        models = sorted({plain_text(item.get("model"))[:40] for item in items if item.get("model")})
+        mine = any(item.get("did") == did or item.get("subjectId") == did for item in items)
+        parts.append(
+            f"{plain_text(where)[:60]}: {len(items)} entries, fields {', '.join(fields)[:400]}; "
+            f"models {', '.join(models)[:200] or 'none'}; this FP2 listed: {'yes' if mine else 'no'}"
+        )
+    return " | ".join(parts)
+
+
+def probe_device_lists(aqara):
+    """Try each candidate device-list endpoint once and log its shape."""
+    probe = getattr(aqara, "probe", None)
+    if probe is None:
+        return
+    for method, path, query in DEVICE_LIST_PROBES:
+        if not _running:
+            return
+        time.sleep(HISTORY_REQUEST_GAP_S)
+        try:
+            res = probe(method, path, query)
+            if not isinstance(res, dict):
+                res = {"code": -1, "message": "the reply was not a JSON object"}
+        except Exception as err:  # noqa: BLE001 - a probe must not stop polling
+            res = {"code": -1, "message": f"{type(err).__name__}: {err}"}
+        log("info", f"Device list probe {method} {path}: {describe_device_list_reply(res, SUBJECT)}")
 
 
 def read_fp2_firmware(aqara, client):
@@ -1717,6 +1795,7 @@ def main():
             if not history_checked:
                 history_checked = True
                 read_fp2_firmware(aqara, client)
+                probe_device_lists(aqara)
                 run_history_check(aqara)
 
         if ok:

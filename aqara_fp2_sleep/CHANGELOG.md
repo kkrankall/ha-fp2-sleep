@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.2
+
+- A one-time startup check logs which Aqara calls list your devices (field
+  names and models only, no IDs).
+
 ## 1.4.1
 
 - The device shows the FP2's own firmware, and "via SleepRadar" shows the

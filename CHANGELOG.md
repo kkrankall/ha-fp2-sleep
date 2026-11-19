@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.2
+
+- Once per start, after the first good poll, SleepRadar tries five
+  candidate device-list endpoints from the Aqara Home app
+  (`/app/v1.0/lumi/app/dev/query/detail`, `/app/v1.0/lumi/dev/query/detail`
+  without `dids`, `/app/v1.0/lumi/app/position/device/query` as GET and POST,
+  and `/app/v1.0/lumi/app/position/query`) and logs only the shape of each
+  reply: Aqara's code, where the list sits, how many entries, their field
+  names and models, and whether this FP2 is listed. No device or position
+  IDs are logged. This finds the call a setup screen would need to list an
+  account's FP2s.
+
 ## 1.4.1
 
 - The device in Home Assistant shows the FP2's own firmware (for example
