@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.4
+
+- Once per start, the log reports what Aqara's history log holds for the last
+  two hours of heart rate, breathing, sleep state and body movement
+  (`History check:` lines). Diagnostic only; nothing new is published.
+
 ## 1.3.3
 
 - `binary_sensor.aqara_fp2_sleep_fp2_online` no longer shows an online FP2 as

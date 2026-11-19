@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.4
+
+Adds a one-time check of Aqara's history log, to learn whether readings the
+app misses between polls could be filled in later.
+
+- After the first good poll of each start, the app asks Aqara's history log
+  (`/app/v1.0/lumi/res/history/log`) for the last two hours of heart rate,
+  breathing, sleep state and body movement, and logs one `History check:`
+  line per reading: how many entries, how far back, the median gap and the
+  values seen. It logs no sensor id and publishes nothing.
+
+- The history log takes numeric resource ids: `0.8.85` heart rate, `0.9.85`
+  breathing, `13.106.85` sleep state and `13.11.85` body movement. They come
+  from Darkdragon14/ha-aqara-devices and match absent42/Aqara-LANLink's FP2
+  catalogue. The Aqara Home iOS app (6.4.5) lists `0.8.85`, `0.9.85` and
+  `13.106.85` next to its sleep-monitor live view.
+
 ## 1.3.3
 
 Fixes the FP2 online flag and makes the card's freshness follow live vitals.
