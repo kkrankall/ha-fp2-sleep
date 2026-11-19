@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.2
+
+Readings now carry the time Aqara measured them, Aqara outages no longer
+trigger a new sign-in, and the FP2's mode and online state are visible.
+
+- Each vital sensor has a `measured_at` attribute with Aqara's own timestamp
+  for that reading. The SleepRadar Card shows "Measured … ago" from it instead
+  of "Updated just now", which only meant the app had polled.
+
+- When Aqara does not answer (network error, timeout, `429` or `5xx`), the
+  app keeps its session and retries on the next poll instead of signing in
+  again. A rejected or missing session still signs in again.
+
+- New diagnostic entities `sensor.aqara_fp2_sleep_fp2_mode` and
+  `binary_sensor.aqara_fp2_sleep_fp2_online`. The log warns when the FP2 is
+  offline or not in Sleep monitoring mode.
+
+- The log names the fields Aqara sends and each measurement's age once per
+  start, without the sensor's id.
+
+- A reading entry Aqara sends in an unexpected shape is skipped instead of
+  stopping the app.
+
 ## 1.3.1
 
 Removes the wrong-key error that blocked USA and China sign-in. Connection
