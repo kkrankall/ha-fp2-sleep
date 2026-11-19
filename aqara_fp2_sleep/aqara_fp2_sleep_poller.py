@@ -89,6 +89,22 @@ ONLINE_CODE = "1"
 OFFLINE_CODE = "0"
 ONLINE_STATES = {ONLINE_CODE: "ON", OFFLINE_CODE: "OFF"}
 
+# Aqara's history log returns every value a resource reported, with its time,
+# but takes numeric resource ids rather than the names res/query uses. These
+# ids come from Darkdragon14/ha-aqara-devices and match absent42/Aqara-LANLink's
+# FP2 catalogue. Once per start the app asks the log for the last two hours of
+# each reading and logs what it holds, to tell whether readings missed between
+# polls could be backfilled. Nothing is published from it yet.
+HISTORY_LOG_PATH = "/app/v1.0/lumi/res/history/log"
+HISTORY_RESOURCE_IDS = {
+    "0.8.85": "heartrate_value",
+    "0.9.85": "respiration_rate_value",
+    "13.106.85": "sleep_state",
+    "13.11.85": "body_movement_value",
+}
+HISTORY_CHECK_WINDOW_S = 2 * 3600
+HISTORY_CHECK_PAGE_SIZE = 300
+
 AREA = os.environ.get("AQARA_AREA", "EU").upper()
 USER = os.environ.get("AQARA_USER", "")
 PASSWORD = os.environ.get("AQARA_PASS", "")
@@ -366,6 +382,23 @@ class Aqara:
             {"data": [{"options": options, "subjectId": did}]},
         )
 
+    def history_log(self, did, resource_ids, start_ms, size=HISTORY_CHECK_PAGE_SIZE, scan_id=""):
+        """One page of the resources' reported values since `start_ms`.
+
+        Same body shape as Aqara's documented fetch.resource.history and the
+        AqaraPOST flow: `scanId` pages onward, `size` caps the page.
+        """
+        return self._post(
+            HISTORY_LOG_PATH,
+            {
+                "resourceIds": list(resource_ids),
+                "scanId": scan_id,
+                "size": str(size),
+                "startTime": int(start_ms),
+                "subjectId": did,
+            },
+        )
+
 
 def discovery_payload(
     attr, object_id, uid_suffix, name, unit, state_class, device_class, icon
@@ -631,6 +664,71 @@ def has_session(aqara):
     """Whether the client holds a session token. A test double without a
     `token` attribute counts as signed in."""
     return bool(getattr(aqara, "token", True))
+
+
+def summarize_history_reply(res, resource_id, now):
+    """One line describing a history-log page for one resource: how many
+    entries, how far back, how densely and over which values. The reply also
+    carries the sensor's id, which stays out of it."""
+    label = f"{HISTORY_RESOURCE_IDS.get(resource_id, resource_id)} ({resource_id})"
+    code = res.get("code")
+    if code != 0:
+        return f"{label}: Aqara code {code_text(code)}: {aqara_error_text(res)}"
+    result = res.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, list):
+        fields = ""
+        if isinstance(result, dict):
+            fields = "; fields: " + (
+                ", ".join(sorted(plain_text(key)[:30] for key in result)) or "none"
+            )
+        return f"{label}: unreadable reply (result is a {type(result).__name__}{fields})"
+    # Only entries for this resource with a usable time count, for the
+    # entry total, the gaps and the values alike.
+    readings = sorted(
+        (seconds, entry.get("value"))
+        for entry in data
+        if isinstance(entry, dict) and entry.get("resourceId", resource_id) == resource_id
+        for seconds in (aqara_time_seconds(entry.get("timeStamp")),)
+        if seconds is not None
+    )
+    stamps = [seconds for seconds, _ in readings]
+    if not stamps:
+        return f"{label}: no entries in the last {HISTORY_CHECK_WINDOW_S // 3600} h"
+    text = (
+        f"{label}: {len(stamps)} entries, from {round((now - stamps[0]) / 60)} min "
+        f"ago to {round(now - stamps[-1])} s ago"
+    )
+    gaps = sorted(later - earlier for earlier, later in zip(stamps, stamps[1:]))
+    if gaps:
+        text += f", median gap {round(gaps[len(gaps) // 2])} s"
+    values = [code_string(value) for _, value in readings]
+    numbers = sorted({int(value) for value in values if value is not None})
+    if numbers:
+        text += f", values {numbers[0]}–{numbers[-1]}" if len(numbers) > 3 else (
+            ", values " + "/".join(str(number) for number in numbers)
+        )
+    if len(data) >= HISTORY_CHECK_PAGE_SIZE:
+        text += "; page full, so older entries exist"
+    return text
+
+
+def run_history_check(aqara, now=None):
+    """Ask the history log once for the last two hours of each reading and
+    log what it holds. Never raises, never touches Health or MQTT."""
+    history_log = getattr(aqara, "history_log", None)
+    if history_log is None:
+        return
+    now = time.time() if now is None else now
+    start_ms = int((now - HISTORY_CHECK_WINDOW_S) * 1000)
+    for resource_id in HISTORY_RESOURCE_IDS:
+        try:
+            res = history_log(SUBJECT, [resource_id], start_ms)
+            if not isinstance(res, dict):
+                res = {"code": -1, "message": "the reply was not a JSON object"}
+        except Exception as err:  # noqa: BLE001 - a diagnostic must not stop polling
+            res = {"code": -1, "message": f"{type(err).__name__}: {err}"}
+        log("info", f"History check: {summarize_history_reply(res, resource_id, now)}")
 
 
 def publish_problem(client, problem, cause=None, code=None, last_success=None):
@@ -1139,6 +1237,8 @@ def main():
     reply_fields_logged = False
     # The FP2's (mode, offline) codes, logged whenever they change.
     last_device_status = None
+    # The history log is checked once per run, after the first good poll.
+    history_checked = False
 
     while _running:
         # Aqara has rejected these credentials. Retrying at the poll interval
@@ -1187,6 +1287,9 @@ def main():
                 log(level, message)
                 last_device_status = (mode, offline)
             log("debug", f"state={state}")
+            if not history_checked:
+                history_checked = True
+                run_history_check(aqara)
 
         if ok:
             auth_delay = AUTH_RETRY_BACKOFF

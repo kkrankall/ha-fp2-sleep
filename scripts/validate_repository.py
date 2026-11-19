@@ -3239,6 +3239,110 @@ def check_measurement_time_and_device_status() -> None:
             fail(f"the sensor id may only be logged at debug level: [{level}] {msg}")
 
 
+def check_history_check() -> None:
+    """The once-per-start history-log check asks for each reading by its
+    numeric id, describes the reply without the sensor id, and can never
+    stop polling."""
+    module = load_poller_module("poller_history_check")
+
+    # The request body matches Aqara's documented history shape.
+    sent = []
+    client = module.Aqara("USA")
+    client._post = lambda path, body: sent.append((path, body)) or {"code": 0}
+    client.history_log("did", ["0.8.85"], 1_700_000_000_123.9)
+    if sent != [(
+        "/app/v1.0/lumi/res/history/log",
+        {
+            "resourceIds": ["0.8.85"],
+            "scanId": "",
+            "size": "300",
+            "startTime": 1_700_000_000_123,
+            "subjectId": "did",
+        },
+    )]:
+        fail(f"unexpected history_log request: {sent}")
+    if set(module.HISTORY_RESOURCE_IDS.values()) != {
+        "heartrate_value", "respiration_rate_value", "sleep_state", "body_movement_value"
+    }:
+        fail(f"the history check must cover the four vitals: {module.HISTORY_RESOURCE_IDS}")
+
+    now = 1_763_520_000.0
+    entry = lambda rid, age, value: {  # noqa: E731 - compact fixture
+        "subjectId": "lumi1.0123456789ab",
+        "resourceId": rid,
+        "timeStamp": int((now - age) * 1000),
+        "value": value,
+    }
+    reply = {"code": 0, "result": {"scanId": "s", "data": [
+        entry("0.8.85", 5, "61"), entry("0.8.85", 15, "63"),
+        entry("0.8.85", 25, "62"), entry("0.9.85", 6, "18"),
+        "junk", {"resourceId": "0.8.85", "timeStamp": "x", "value": "60"},
+    ]}}
+    line = module.summarize_history_reply(reply, "0.8.85", now)
+    for part in ("heartrate_value (0.8.85)", "3 entries", "median gap 10 s", "values 61/62/63"):
+        if part not in line:
+            fail(f"history summary missing {part!r}: {line}")
+    if "lumi1." in line or "page full" in line:
+        fail(f"unexpected history summary: {line}")
+    full = {"code": 0, "result": {"data": [entry("13.106.85", 60 * i, "4") for i in range(300)]}}
+    line = module.summarize_history_reply(full, "13.106.85", now)
+    if "300 entries" not in line or "page full" not in line or "values 4" not in line:
+        fail(f"a full page must say older entries exist: {line}")
+    for res, want in (
+        ({"code": 755, "message": "no permission"}, "Aqara code 755"),
+        ({"code": 0, "result": ["x"]}, "unreadable reply (result is a list)"),
+        ({"code": 0, "result": {"rows": []}}, "fields: rows"),
+        ({"code": 0, "result": {"data": []}}, "no entries in the last 2 h"),
+    ):
+        line = module.summarize_history_reply(res, "0.9.85", now)
+        if want not in line:
+            fail(f"history summary for {res} must say {want!r}: {line}")
+
+    # Through main(): once per run after the first good poll, one request per
+    # reading, two hours back, and a failing log never stops polling.
+    for raising in (False, True):
+        module = load_poller_module(f"poller_history_loop_{raising}")
+        calls = []
+
+        class HistoryAqara:
+            def __init__(self, area):
+                self.last_error = None
+                self.token = None
+
+            def login(self):
+                self.token = "t"
+                return True
+
+            def res_query(self, did, options):
+                return {"code": 0, "result": [{"attr": "sleep_state", "value": "4"}]}
+
+            def history_log(self, did, resource_ids, start_ms):
+                calls.append((tuple(resource_ids), start_ms))
+                if raising:
+                    raise OSError("connection reset")
+                return reply
+
+        before = module.time.time()
+        published, logged = _drive_poll_loop(module, HistoryAqara, 3)
+        states = [p for topic, p in published if topic == module.STATE_TOPIC]
+        if len(states) != 3:
+            fail(f"the history check must not stop polling (raising={raising}): {len(states)} polls")
+        if sorted(rid for rids, _ in calls for rid in rids) != sorted(module.HISTORY_RESOURCE_IDS):
+            fail(f"the history check must ask once per reading per run: {calls}")
+        for _, start_ms in calls:
+            age = before - start_ms / 1000
+            if not module.HISTORY_CHECK_WINDOW_S - 5 <= age <= module.HISTORY_CHECK_WINDOW_S + 5:
+                fail(f"the history check must look back two hours, not {age:.0f} s")
+        lines = [msg for level, msg in logged if msg.startswith("History check:")]
+        if len(lines) != len(module.HISTORY_RESOURCE_IDS):
+            fail(f"one history line per reading expected: {lines}")
+        if raising and not all("connection reset" in msg for msg in lines):
+            fail(f"a failing history request must be described: {lines}")
+        for level, msg in logged:
+            if level != "debug" and "lumi1." in msg:
+                fail(f"the sensor id may only be logged at debug level: [{level}] {msg}")
+
+
 def check_notification_failure_is_soft() -> None:
     """Losing a notification must never take the poller down."""
     module = load_poller_module("poller_notify_soft")
@@ -5054,6 +5158,7 @@ def main(argv: list[str] | None = None) -> None:
     check_auth_backoff_schedule()
     check_transient_query_keeps_session()
     check_measurement_time_and_device_status()
+    check_history_check()
     check_notification_failure_is_soft()
     validate_run_script()
     validate_examples()
