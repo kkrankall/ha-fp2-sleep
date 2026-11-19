@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.7
+
+- The history check also lists every sleep-stage change Aqara logged in the
+  last 14 hours (`History check, sleep stage changes …`), oldest first, with
+  local time, code and label. One request; enough to rebuild a night the app
+  missed, for example by importing corrected statistics.
+
 ## 1.3.6
 
 - The history check then scans heart rate through one whole past night: the

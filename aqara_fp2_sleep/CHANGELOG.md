@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.7
+
+- The history check lists every sleep-stage change of the last 14 hours.
+
 ## 1.3.6
 
 - The history check also scans heart rate hour by hour through one past
