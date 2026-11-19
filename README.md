@@ -68,7 +68,8 @@ in bed. Sleep state refreshes only when the stage changes, so its
 `measured_at` shows when the current stage began.
 
 Once per start, the app log also reports what Aqara's history log holds for
-the last two hours of each vital (`History check:` lines). It is a diagnostic
+the last two hours of each vital (`History check:` lines) and for an hour of
+each of the past seven nights (`History check, hour ending …`). It is a diagnostic
 for filling readings missed between polls; nothing is published from it yet.
 
 Three diagnostic entities sit alongside them:

@@ -3261,6 +3261,10 @@ def check_history_check() -> None:
         },
     )]:
         fail(f"unexpected history_log request: {sent}")
+    sent.clear()
+    client.history_log("did", ["0.9.85"], 1_000, end_ms=4_600.7)
+    if sent[0][1].get("endTime") != 4_600 or sent[0][1].get("startTime") != 1_000:
+        fail(f"an end_ms must be sent as endTime: {sent}")
     if set(module.HISTORY_RESOURCE_IDS.values()) != {
         "heartrate_value", "respiration_rate_value", "sleep_state", "body_movement_value"
     }:
@@ -3298,10 +3302,42 @@ def check_history_check() -> None:
         if want not in line:
             fail(f"history summary for {res} must say {want!r}: {line}")
 
+    # Past nights: the last seven local 02:00s before now, newest first.
+    ends = module.night_sample_ends(now)
+    if len(ends) != module.HISTORY_NIGHTS or ends != sorted(ends, reverse=True):
+        fail(f"night_sample_ends must give {module.HISTORY_NIGHTS} ends, newest first: {ends}")
+    for end in ends:
+        local = module.time.localtime(end)
+        if end > now or (local.tm_hour, local.tm_min) != (module.HISTORY_NIGHT_HOUR, 0):
+            fail(f"a night sample must end at local {module.HISTORY_NIGHT_HOUR}:00 before now: {end}")
+    for earlier, later in zip(ends[1:], ends):
+        if not 82_800 <= later - earlier <= 90_000:
+            fail(f"night samples must be a day apart: {later - earlier}")
+    end_s = now - 100
+    window = {"code": 0, "result": {"data": [
+        entry("0.8.85", 200, "64"), entry("0.8.85", 300, "71"), entry("0.8.85", 50, "99"),
+    ]}}
+    part = module.describe_night_window(window, "0.8.85", end_s - 3600, end_s)
+    if part != "heartrate_value 2 entries, values 64/71":
+        fail(f"a night window must count only entries inside it: {part!r}")
+    late = {"code": 0, "result": {"data": [entry("0.9.85", 10, "20")]}}
+    part = module.describe_night_window(late, "0.9.85", end_s - 3600, end_s)
+    if "endTime not honoured" not in part:
+        fail(f"entries all after the window must be called out: {part!r}")
+    for res, want in (
+        ({"code": 0, "result": {"data": []}}, "sleep_state none"),
+        ({"code": 755, "message": "m"}, "sleep_state Aqara code 755"),
+    ):
+        part = module.describe_night_window(res, "13.106.85", end_s - 3600, end_s)
+        if not part.startswith(want):
+            fail(f"night window for {res} must start {want!r}: {part!r}")
+
     # Through main(): once per run after the first good poll, one request per
-    # reading, two hours back, and a failing log never stops polling.
+    # reading two hours back, then one per reading per past night, and a
+    # failing log never stops polling.
     for raising in (False, True):
         module = load_poller_module(f"poller_history_loop_{raising}")
+        module.HISTORY_REQUEST_GAP_S = 0
         calls = []
 
         class HistoryAqara:
@@ -3316,8 +3352,8 @@ def check_history_check() -> None:
             def res_query(self, did, options):
                 return {"code": 0, "result": [{"attr": "sleep_state", "value": "4"}]}
 
-            def history_log(self, did, resource_ids, start_ms):
-                calls.append((tuple(resource_ids), start_ms))
+            def history_log(self, did, resource_ids, start_ms, end_ms=None):
+                calls.append((tuple(resource_ids), start_ms, end_ms))
                 if raising:
                     raise OSError("connection reset")
                 return reply
@@ -3327,17 +3363,27 @@ def check_history_check() -> None:
         states = [p for topic, p in published if topic == module.STATE_TOPIC]
         if len(states) != 3:
             fail(f"the history check must not stop polling (raising={raising}): {len(states)} polls")
-        if sorted(rid for rids, _ in calls for rid in rids) != sorted(module.HISTORY_RESOURCE_IDS):
-            fail(f"the history check must ask once per reading per run: {calls}")
-        for _, start_ms in calls:
+        recent = [c for c in calls if c[2] is None]
+        nightly = [c for c in calls if c[2] is not None]
+        if sorted(rid for rids, _, _ in recent for rid in rids) != sorted(module.HISTORY_RESOURCE_IDS):
+            fail(f"the history check must ask once per reading per run: {recent}")
+        for _, start_ms, _ in recent:
             age = before - start_ms / 1000
             if not module.HISTORY_CHECK_WINDOW_S - 5 <= age <= module.HISTORY_CHECK_WINDOW_S + 5:
                 fail(f"the history check must look back two hours, not {age:.0f} s")
+        if len(nightly) != module.HISTORY_NIGHTS * len(module.HISTORY_RESOURCE_IDS):
+            fail(f"one request per reading per past night expected: {len(nightly)}")
+        for _, start_ms, end_ms in nightly:
+            if end_ms - start_ms != module.HISTORY_NIGHT_WINDOW_S * 1000:
+                fail(f"a past-night window must be one hour: {start_ms}..{end_ms}")
         lines = [msg for level, msg in logged if msg.startswith("History check:")]
         if len(lines) != len(module.HISTORY_RESOURCE_IDS):
             fail(f"one history line per reading expected: {lines}")
-        if raising and not all("connection reset" in msg for msg in lines):
-            fail(f"a failing history request must be described: {lines}")
+        night_lines = [msg for level, msg in logged if msg.startswith("History check, hour ending")]
+        if len(night_lines) != module.HISTORY_NIGHTS:
+            fail(f"one line per past night expected: {night_lines}")
+        if raising and not all("connection reset" in msg for msg in lines + night_lines):
+            fail(f"a failing history request must be described: {lines + night_lines}")
         for level, msg in logged:
             if level != "debug" and "lumi1." in msg:
                 fail(f"the sensor id may only be logged at debug level: [{level}] {msg}")

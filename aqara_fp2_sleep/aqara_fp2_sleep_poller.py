@@ -104,6 +104,13 @@ HISTORY_RESOURCE_IDS = {
 }
 HISTORY_CHECK_WINDOW_S = 2 * 3600
 HISTORY_CHECK_PAGE_SIZE = 300
+# The check also samples one hour of each of the past nights, ending at this
+# local hour, to tell a bad night from a sensor that never measures.
+HISTORY_NIGHTS = 7
+HISTORY_NIGHT_HOUR = 2
+HISTORY_NIGHT_WINDOW_S = 3600
+# Pause between the past-night requests so the check is not a burst.
+HISTORY_REQUEST_GAP_S = 1.0
 
 AREA = os.environ.get("AQARA_AREA", "EU").upper()
 USER = os.environ.get("AQARA_USER", "")
@@ -382,22 +389,26 @@ class Aqara:
             {"data": [{"options": options, "subjectId": did}]},
         )
 
-    def history_log(self, did, resource_ids, start_ms, size=HISTORY_CHECK_PAGE_SIZE, scan_id=""):
+    def history_log(
+        self, did, resource_ids, start_ms, size=HISTORY_CHECK_PAGE_SIZE, scan_id="", end_ms=None
+    ):
         """One page of the resources' reported values since `start_ms`.
 
         Same body shape as Aqara's documented fetch.resource.history and the
-        AqaraPOST flow: `scanId` pages onward, `size` caps the page.
+        AqaraPOST flow: `scanId` pages onward, `size` caps the page, and the
+        optional `endTime` (documented, not yet seen honoured by the app API)
+        ends the window.
         """
-        return self._post(
-            HISTORY_LOG_PATH,
-            {
-                "resourceIds": list(resource_ids),
-                "scanId": scan_id,
-                "size": str(size),
-                "startTime": int(start_ms),
-                "subjectId": did,
-            },
-        )
+        body = {
+            "resourceIds": list(resource_ids),
+            "scanId": scan_id,
+            "size": str(size),
+            "startTime": int(start_ms),
+            "subjectId": did,
+        }
+        if end_ms is not None:
+            body["endTime"] = int(end_ms)
+        return self._post(HISTORY_LOG_PATH, body)
 
 
 def discovery_payload(
@@ -666,14 +677,16 @@ def has_session(aqara):
     return bool(getattr(aqara, "token", True))
 
 
-def summarize_history_reply(res, resource_id, now):
-    """One line describing a history-log page for one resource: how many
-    entries, how far back, how densely and over which values. The reply also
-    carries the sensor's id, which stays out of it."""
-    label = f"{HISTORY_RESOURCE_IDS.get(resource_id, resource_id)} ({resource_id})"
+def history_readings(res, resource_id):
+    """(readings, page size, problem) from a history-log reply.
+
+    readings are (epoch seconds, value) for this resource, oldest first; only
+    entries with a usable time count. problem is a short description when the
+    reply is a rejection or cannot be read, else None.
+    """
     code = res.get("code")
     if code != 0:
-        return f"{label}: Aqara code {code_text(code)}: {aqara_error_text(res)}"
+        return [], 0, f"Aqara code {code_text(code)}: {aqara_error_text(res)}"
     result = res.get("result")
     data = result.get("data") if isinstance(result, dict) else None
     if not isinstance(data, list):
@@ -682,9 +695,7 @@ def summarize_history_reply(res, resource_id, now):
             fields = "; fields: " + (
                 ", ".join(sorted(plain_text(key)[:30] for key in result)) or "none"
             )
-        return f"{label}: unreadable reply (result is a {type(result).__name__}{fields})"
-    # Only entries for this resource with a usable time count, for the
-    # entry total, the gaps and the values alike.
+        return [], 0, f"unreadable reply (result is a {type(result).__name__}{fields})"
     readings = sorted(
         (seconds, entry.get("value"))
         for entry in data
@@ -692,6 +703,27 @@ def summarize_history_reply(res, resource_id, now):
         for seconds in (aqara_time_seconds(entry.get("timeStamp")),)
         if seconds is not None
     )
+    return readings, len(data), None
+
+
+def describe_values(readings):
+    """The distinct integer values seen, as a/b/c or as a min–max range."""
+    numbers = sorted({int(v) for v in (code_string(value) for _, value in readings) if v})
+    if not numbers:
+        return "no integer values"
+    if len(numbers) > 3:
+        return f"{numbers[0]}–{numbers[-1]}"
+    return "/".join(str(number) for number in numbers)
+
+
+def summarize_history_reply(res, resource_id, now):
+    """One line describing a history-log page for one resource: how many
+    entries, how far back, how densely and over which values. The reply also
+    carries the sensor's id, which stays out of it."""
+    label = f"{HISTORY_RESOURCE_IDS.get(resource_id, resource_id)} ({resource_id})"
+    readings, page, problem = history_readings(res, resource_id)
+    if problem:
+        return f"{label}: {problem}"
     stamps = [seconds for seconds, _ in readings]
     if not stamps:
         return f"{label}: no entries in the last {HISTORY_CHECK_WINDOW_S // 3600} h"
@@ -702,33 +734,81 @@ def summarize_history_reply(res, resource_id, now):
     gaps = sorted(later - earlier for earlier, later in zip(stamps, stamps[1:]))
     if gaps:
         text += f", median gap {round(gaps[len(gaps) // 2])} s"
-    values = [code_string(value) for _, value in readings]
-    numbers = sorted({int(value) for value in values if value is not None})
-    if numbers:
-        text += f", values {numbers[0]}–{numbers[-1]}" if len(numbers) > 3 else (
-            ", values " + "/".join(str(number) for number in numbers)
-        )
-    if len(data) >= HISTORY_CHECK_PAGE_SIZE:
+    text += f", values {describe_values(readings)}"
+    if page >= HISTORY_CHECK_PAGE_SIZE:
         text += "; page full, so older entries exist"
     return text
 
 
+def night_sample_ends(now, nights=HISTORY_NIGHTS, hour=HISTORY_NIGHT_HOUR):
+    """Epoch seconds of the last `nights` local `hour`:00 moments before
+    `now`, newest first. mktime normalises the day, so month starts and DST
+    changes need no special case."""
+    lt = time.localtime(now)
+    ends = []
+    for back in range(nights + 1):
+        end = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - back, hour, 0, 0, 0, 0, -1))
+        if end <= now:
+            ends.append(end)
+    return ends[:nights]
+
+
+def describe_night_window(res, resource_id, start_s, end_s):
+    """A short fragment for one resource in one past-night window."""
+    name = HISTORY_RESOURCE_IDS.get(resource_id, resource_id)
+    readings, _page, problem = history_readings(res, resource_id)
+    if problem:
+        return f"{name} {problem}"
+    inside = [r for r in readings if start_s - 1 <= r[0] <= end_s + 1]
+    if readings and not inside:
+        return f"{name} {len(readings)} entries, all outside the window (endTime not honoured)"
+    if not inside:
+        return f"{name} none"
+    return f"{name} {len(inside)} entries, values {describe_values(inside)}"
+
+
+def _history_request(history_log, resource_id, start_ms, end_ms=None):
+    """One history-log request that never raises."""
+    try:
+        if end_ms is None:
+            res = history_log(SUBJECT, [resource_id], start_ms)
+        else:
+            res = history_log(SUBJECT, [resource_id], start_ms, end_ms=end_ms)
+        if not isinstance(res, dict):
+            res = {"code": -1, "message": "the reply was not a JSON object"}
+    except Exception as err:  # noqa: BLE001 - a diagnostic must not stop polling
+        res = {"code": -1, "message": f"{type(err).__name__}: {err}"}
+    return res
+
+
 def run_history_check(aqara, now=None):
-    """Ask the history log once for the last two hours of each reading and
-    log what it holds. Never raises, never touches Health or MQTT."""
+    """Ask the history log once for the last two hours of each reading, and
+    for an hour of each of the past nights, and log what it holds. Never
+    raises, never touches Health or MQTT."""
     history_log = getattr(aqara, "history_log", None)
     if history_log is None:
         return
     now = time.time() if now is None else now
     start_ms = int((now - HISTORY_CHECK_WINDOW_S) * 1000)
     for resource_id in HISTORY_RESOURCE_IDS:
-        try:
-            res = history_log(SUBJECT, [resource_id], start_ms)
-            if not isinstance(res, dict):
-                res = {"code": -1, "message": "the reply was not a JSON object"}
-        except Exception as err:  # noqa: BLE001 - a diagnostic must not stop polling
-            res = {"code": -1, "message": f"{type(err).__name__}: {err}"}
+        res = _history_request(history_log, resource_id, start_ms)
         log("info", f"History check: {summarize_history_reply(res, resource_id, now)}")
+
+    # Past nights: one hour ending at HISTORY_NIGHT_HOUR local time, so a
+    # flat or missing reading can be told apart from a bad night.
+    for end_s in night_sample_ends(now):
+        start_s = end_s - HISTORY_NIGHT_WINDOW_S
+        parts = []
+        for resource_id in HISTORY_RESOURCE_IDS:
+            if not _running:
+                return
+            time.sleep(HISTORY_REQUEST_GAP_S)
+            res = _history_request(
+                history_log, resource_id, int(start_s * 1000), end_ms=int(end_s * 1000)
+            )
+            parts.append(describe_night_window(res, resource_id, start_s, end_s))
+        stamp = time.strftime("%a %d %b %H:%M %Z", time.localtime(end_s))
+        log("info", f"History check, hour ending {stamp}: " + "; ".join(parts))
 
 
 def publish_problem(client, problem, cause=None, code=None, last_success=None):
