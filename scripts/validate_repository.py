@@ -3302,6 +3302,23 @@ def check_history_check() -> None:
         if want not in line:
             fail(f"history summary for {res} must say {want!r}: {line}")
 
+    # Full-night scan helpers.
+    if module.readings_spread([(0, "60"), (1, "66"), (2, "x")]) != 6 or module.readings_spread([]) != -1:
+        fail("readings_spread must be max minus min, or -1 with no values")
+    scan_ends = module.night_scan_ends(module.night_sample_ends(now)[0])
+    hours = [module.time.localtime(t).tm_hour for t in scan_ends]
+    if hours != [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]:
+        fail(f"night_scan_ends must cover 19:00-07:00 hour by hour: {hours}")
+    scan_end = now - 100
+    window = {"code": 0, "result": {"data": [
+        entry("0.8.85", 700, "60"), entry("0.8.85", 600, "62"), entry("0.8.85", 500, "60"),
+    ]}}
+    part = module.describe_scan_window(window, "0.8.85", scan_end - 3600, scan_end)
+    if not part.endswith("60/62 (2 changes)"):
+        fail(f"a scan window must give its values and changes: {part!r}")
+    if not module.describe_scan_window({"code": 0, "result": {"data": []}}, "0.8.85", 0, 1).endswith(" none"):
+        fail("an empty scan window must say none")
+
     # Past nights: the last seven local 02:00s before now, newest first.
     ends = module.night_sample_ends(now)
     if len(ends) != module.HISTORY_NIGHTS or ends != sorted(ends, reverse=True):
@@ -3356,7 +3373,17 @@ def check_history_check() -> None:
                 calls.append((tuple(resource_ids), start_ms, end_ms))
                 if raising:
                     raise OSError("connection reset")
-                return reply
+                if end_ms is None:
+                    return reply
+                # Inside the window: breathing varies most on the third
+                # night back; heart rate changes once in every window.
+                rid = resource_ids[0]
+                night = sum(1 for c in calls if c[0] == ("0.9.85",) and c[2] is not None)
+                spread = {3: 6, 5: 2}.get(night, 0) if rid == "0.9.85" else 1
+                return {"code": 0, "result": {"data": [
+                    {"resourceId": rid, "timeStamp": end_ms - 60_000, "value": str(60 + spread)},
+                    {"resourceId": rid, "timeStamp": end_ms - 120_000, "value": "60"},
+                ]}}
 
         before = module.time.time()
         published, logged = _drive_poll_loop(module, HistoryAqara, 3)
@@ -3364,7 +3391,28 @@ def check_history_check() -> None:
         if len(states) != 3:
             fail(f"the history check must not stop polling (raising={raising}): {len(states)} polls")
         recent = [c for c in calls if c[2] is None]
-        nightly = [c for c in calls if c[2] is not None]
+        scan = calls[-module.HISTORY_SCAN_HOURS:]
+        nightly = [c for c in calls[:-module.HISTORY_SCAN_HOURS] if c[2] is not None]
+        if any(rids != (module.HEART_RATE_ID,) for rids, _, _ in scan):
+            fail(f"the full-night scan must ask for heart rate only: {scan}")
+        scan_ends = [end_ms / 1000 for _, _, end_ms in scan]
+        # One hour apart; a DST change night may skip or repeat an hour.
+        if not all(0 < b - a <= 7200 for a, b in zip(scan_ends, scan_ends[1:])):
+            fail(f"the full-night scan must step one hour at a time: {scan_ends}")
+        first, last = (module.time.localtime(t).tm_hour for t in (scan_ends[0], scan_ends[-1]))
+        if (first, last) != (module.HISTORY_SCAN_FIRST_HOUR, 7):
+            fail(f"the full-night scan must run from 20:00 to 07:00: {first}..{last}")
+        night_ends = module.night_sample_ends(module.time.time())
+        if not raising and not (night_ends[2] - 86_400 < scan_ends[0] < night_ends[2]):
+            fail("the full-night scan must cover the night whose breathing varied most")
+        scan_lines = [msg for level, msg in logged if msg.startswith("History check, heart rate through")]
+        if len(scan_lines) != 1:
+            fail(f"one full-night heart-rate line expected: {scan_lines}")
+        if not raising and ("varied most, by 6" not in scan_lines[0]
+                            or "20:00 60/61 (1 change)" not in scan_lines[0]):
+            fail(f"the full-night line must name the reason and the changes: {scan_lines[0]}")
+        if raising and "most recent" not in scan_lines[0]:
+            fail(f"with no breathing data the most recent night is scanned: {scan_lines[0]}")
         if sorted(rid for rids, _, _ in recent for rid in rids) != sorted(module.HISTORY_RESOURCE_IDS):
             fail(f"the history check must ask once per reading per run: {recent}")
         for _, start_ms, _ in recent:

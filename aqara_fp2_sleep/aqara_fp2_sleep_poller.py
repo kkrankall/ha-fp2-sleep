@@ -111,6 +111,12 @@ HISTORY_NIGHT_HOUR = 2
 HISTORY_NIGHT_WINDOW_S = 3600
 # Pause between the past-night requests so the check is not a burst.
 HISTORY_REQUEST_GAP_S = 1.0
+# The check then scans heart rate through one whole past night, one window
+# per hour from 19:00 to 07:00, to see how often the FP2 updates it.
+HEART_RATE_ID = "0.8.85"
+BREATHING_ID = "0.9.85"
+HISTORY_SCAN_FIRST_HOUR = 20
+HISTORY_SCAN_HOURS = 12
 
 AREA = os.environ.get("AQARA_AREA", "EU").upper()
 USER = os.environ.get("AQARA_USER", "")
@@ -767,6 +773,41 @@ def describe_night_window(res, resource_id, start_s, end_s):
     return f"{name} {len(inside)} entries, values {describe_values(inside)}"
 
 
+def readings_spread(readings):
+    """Max minus min of the integer values, or -1 when there are none."""
+    numbers = [int(v) for v in (code_string(value) for _, value in readings) if v]
+    return max(numbers) - min(numbers) if numbers else -1
+
+
+def night_scan_ends(night_end_s, first_hour=HISTORY_SCAN_FIRST_HOUR, hours=HISTORY_SCAN_HOURS):
+    """Ends of the hour-long windows covering the night that `night_end_s`
+    (that night's HISTORY_NIGHT_HOUR) falls in: from `first_hour`:00 the
+    evening before, one per hour. mktime normalises hours past 23."""
+    lt = time.localtime(night_end_s)
+    return [
+        time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - 1, first_hour + i, 0, 0, 0, 0, -1))
+        for i in range(hours)
+    ]
+
+
+def describe_scan_window(res, resource_id, start_s, end_s):
+    """`HH:00 values (n changes)` for one hour of a full-night scan, labelled
+    by the hour it ends."""
+    label = f"{time.localtime(end_s).tm_hour:02d}:00"
+    readings, _page, problem = history_readings(res, resource_id)
+    if problem:
+        return f"{label} {problem}"
+    inside = [r for r in readings if start_s - 1 <= r[0] <= end_s + 1]
+    if not inside:
+        return f"{label} none"
+    values = [code_string(value) for _, value in inside]
+    changes = sum(1 for before, after in zip(values, values[1:]) if before != after)
+    text = f"{label} {describe_values(inside)}"
+    if changes:
+        text += f" ({changes} change{'' if changes == 1 else 's'})"
+    return text
+
+
 def _history_request(history_log, resource_id, start_ms, end_ms=None):
     """One history-log request that never raises."""
     try:
@@ -796,7 +837,9 @@ def run_history_check(aqara, now=None):
 
     # Past nights: one hour ending at HISTORY_NIGHT_HOUR local time, so a
     # flat or missing reading can be told apart from a bad night.
-    for end_s in night_sample_ends(now):
+    night_ends = night_sample_ends(now)
+    best_end, best_spread = (night_ends[0] if night_ends else None), -1
+    for end_s in night_ends:
         start_s = end_s - HISTORY_NIGHT_WINDOW_S
         parts = []
         for resource_id in HISTORY_RESOURCE_IDS:
@@ -807,8 +850,43 @@ def run_history_check(aqara, now=None):
                 history_log, resource_id, int(start_s * 1000), end_ms=int(end_s * 1000)
             )
             parts.append(describe_night_window(res, resource_id, start_s, end_s))
+            if resource_id == BREATHING_ID:
+                readings, _page, _problem = history_readings(res, resource_id)
+                spread = readings_spread(
+                    [r for r in readings if start_s - 1 <= r[0] <= end_s + 1]
+                )
+                # Newest first, so a tie keeps the more recent night.
+                if spread > best_spread:
+                    best_end, best_spread = end_s, spread
         stamp = time.strftime("%a %d %b %H:%M %Z", time.localtime(end_s))
         log("info", f"History check, hour ending {stamp}: " + "; ".join(parts))
+
+    # Heart rate through one whole night: the past night whose breathing
+    # varied most, since breathing shows the FP2 had a vitals lock then. One
+    # hour-long window per hour of the night shows how often heart rate moves.
+    if best_end is None:
+        return
+    parts = []
+    for end_s in night_scan_ends(best_end):
+        if not _running:
+            return
+        time.sleep(HISTORY_REQUEST_GAP_S)
+        start_s = end_s - HISTORY_NIGHT_WINDOW_S
+        res = _history_request(
+            history_log, HEART_RATE_ID, int(start_s * 1000), end_ms=int(end_s * 1000)
+        )
+        parts.append(describe_scan_window(res, HEART_RATE_ID, start_s, end_s))
+    evening = time.strftime("%a %d %b", time.localtime(best_end - 12 * 3600))
+    reason = (
+        f"breathing varied most, by {best_spread}"
+        if best_spread > 0
+        else "no night's breathing varied, so the most recent"
+    )
+    log(
+        "info",
+        f"History check, heart rate through the night of {evening} ({reason}; "
+        "each hour shows its last ~30 min): " + "; ".join(parts),
+    )
 
 
 def publish_problem(client, problem, cause=None, code=None, last_success=None):
