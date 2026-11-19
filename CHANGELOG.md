@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.1
+
+- The device in Home Assistant shows the FP2's own firmware (for example
+  `1.3.0_0002.0092`), read once per start from Aqara's device details
+  (`/app/v1.0/lumi/dev/query/detail`, signed like the AqaraPOST flow, retried
+  with the query string signed on "Invalid sign"). It used to show a
+  hard-coded `aqara_fp2_sleep 1.0.0`.
+
+- The MQTT origin ("via SleepRadar …") shows SleepRadar's real version,
+  baked into the image from the Supervisor's `BUILD_VERSION`, instead of a
+  hard-coded `1.0.0`.
+
 ## 1.4.0
 
 Adds night totals computed from Aqara's own timestamps.

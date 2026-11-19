@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1
+
+- The device shows the FP2's own firmware, and "via SleepRadar" shows the
+  real app version.
+
 ## 1.4.0
 
 - New night totals: hours asleep, light, deep and REM since 18:00, from
