@@ -117,6 +117,18 @@ HEART_RATE_ID = "0.8.85"
 BREATHING_ID = "0.9.85"
 HISTORY_SCAN_FIRST_HOUR = 20
 HISTORY_SCAN_HOURS = 12
+# The check also lists every sleep-stage change of the last 14 hours, so a
+# night the app missed (a late start, an outage) can be reconstructed.
+SLEEP_STATE_ID = "13.106.85"
+HISTORY_STAGE_WINDOW_S = 14 * 3600
+STAGE_LABELS = {
+    "0": "out of bed",
+    "1": "in bed",
+    "2": "awake",
+    "3": "REM",
+    "4": "light",
+    "5": "deep",
+}
 
 AREA = os.environ.get("AQARA_AREA", "EU").upper()
 USER = os.environ.get("AQARA_USER", "")
@@ -808,6 +820,25 @@ def describe_scan_window(res, resource_id, start_s, end_s):
     return text
 
 
+def describe_stage_changes(res):
+    """`HH:MM code label` for each sleep-stage entry, oldest first, in local
+    time. Labels follow the community mapping SleepRadar documents."""
+    readings, page, problem = history_readings(res, SLEEP_STATE_ID)
+    if problem:
+        return problem
+    if not readings:
+        return "none"
+    parts = []
+    for seconds, value in readings:
+        code = code_string(value)
+        label = STAGE_LABELS.get(code, "unmapped")
+        parts.append(f"{time.strftime('%H:%M', time.localtime(seconds))} {code} {label}")
+    text = ", ".join(parts)
+    if page >= HISTORY_CHECK_PAGE_SIZE:
+        text += "; page full, so older changes exist"
+    return text
+
+
 def _history_request(history_log, resource_id, start_ms, end_ms=None):
     """One history-log request that never raises."""
     try:
@@ -834,6 +865,17 @@ def run_history_check(aqara, now=None):
     for resource_id in HISTORY_RESOURCE_IDS:
         res = _history_request(history_log, resource_id, start_ms)
         log("info", f"History check: {summarize_history_reply(res, resource_id, now)}")
+
+    # Every sleep-stage change of the last HISTORY_STAGE_WINDOW_S, oldest
+    # first. Stage changes are sparse, so one page holds a whole night, and
+    # the list lets a night the app missed be reconstructed exactly.
+    stage_start_ms = int((now - HISTORY_STAGE_WINDOW_S) * 1000)
+    res = _history_request(history_log, SLEEP_STATE_ID, stage_start_ms, end_ms=int(now * 1000))
+    log(
+        "info",
+        f"History check, sleep stage changes in the last "
+        f"{HISTORY_STAGE_WINDOW_S // 3600} h: {describe_stage_changes(res)}",
+    )
 
     # Past nights: one hour ending at HISTORY_NIGHT_HOUR local time, so a
     # flat or missing reading can be told apart from a bad night.

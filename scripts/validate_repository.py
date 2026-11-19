@@ -3302,6 +3302,21 @@ def check_history_check() -> None:
         if want not in line:
             fail(f"history summary for {res} must say {want!r}: {line}")
 
+    # Stage-change list: oldest first, local HH:MM, code and label.
+    changes = {"code": 0, "result": {"data": [
+        entry("13.106.85", 600, "5"), entry("13.106.85", 1800, "4"), entry("13.106.85", 60, "7"),
+        entry("0.8.85", 900, "61"),
+    ]}}
+    text = module.describe_stage_changes(changes)
+    stamps = [module.time.strftime("%H:%M", module.time.localtime(now - age)) for age in (1800, 600, 60)]
+    want = f"{stamps[0]} 4 light, {stamps[1]} 5 deep, {stamps[2]} 7 unmapped"
+    if text != want:
+        fail(f"stage changes must list time, code and label oldest first: {text!r} != {want!r}")
+    if module.describe_stage_changes({"code": 0, "result": {"data": []}}) != "none":
+        fail("no stage changes must read none")
+    if not module.describe_stage_changes({"code": 755, "message": "m"}).startswith("Aqara code 755"):
+        fail("a rejected stage-change request must be described")
+
     # Full-night scan helpers.
     if module.readings_spread([(0, "60"), (1, "66"), (2, "x")]) != 6 or module.readings_spread([]) != -1:
         fail("readings_spread must be max minus min, or -1 with no values")
@@ -3391,8 +3406,20 @@ def check_history_check() -> None:
         if len(states) != 3:
             fail(f"the history check must not stop polling (raising={raising}): {len(states)} polls")
         recent = [c for c in calls if c[2] is None]
+        stage = calls[len(recent)]
         scan = calls[-module.HISTORY_SCAN_HOURS:]
-        nightly = [c for c in calls[:-module.HISTORY_SCAN_HOURS] if c[2] is not None]
+        nightly = calls[len(recent) + 1:-module.HISTORY_SCAN_HOURS]
+        if stage[0] != (module.SLEEP_STATE_ID,) or not (
+            module.HISTORY_STAGE_WINDOW_S - 5
+            <= (stage[2] - stage[1]) / 1000
+            <= module.HISTORY_STAGE_WINDOW_S + 5
+        ):
+            fail(f"the stage-change request must cover the last 14 h of sleep_state: {stage}")
+        stage_lines = [msg for level, msg in logged if msg.startswith("History check, sleep stage changes")]
+        if len(stage_lines) != 1:
+            fail(f"one stage-change line expected: {stage_lines}")
+        if raising and "connection reset" not in stage_lines[0]:
+            fail(f"a failing stage-change request must be described: {stage_lines[0]}")
         if any(rids != (module.HEART_RATE_ID,) for rids, _, _ in scan):
             fail(f"the full-night scan must ask for heart rate only: {scan}")
         scan_ends = [end_ms / 1000 for _, _, end_ms in scan]
