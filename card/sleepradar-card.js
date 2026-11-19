@@ -364,8 +364,8 @@ class SleepradarCard extends HTMLElement {
     const signatureValues = [
       typeof darkMode === "boolean" ? darkMode : null,
       stateObj && [stateObj.state, stateObj.last_updated, measuredAtOf(stateObj)],
-      hrObj && [hrObj.state, hrObj.last_updated],
-      brObj && [brObj.state, brObj.last_updated],
+      hrObj && [hrObj.state, hrObj.last_updated, measuredAtOf(hrObj)],
+      brObj && [brObj.state, brObj.last_updated, measuredAtOf(brObj)],
     ];
     if (this._bedOccupancy) {
       signatureValues.push(occupancyObj && [occupancyObj.state, occupancyObj.last_updated]);
@@ -450,15 +450,22 @@ class SleepradarCard extends HTMLElement {
     const shownBr = canShowLiveVitals ? br : null;
 
     // Hiding and the stale badge still follow the poller (last_updated). The
-    // label and time switch to Aqara's measurement time when the app sends
-    // one, so a reading Aqara took long ago no longer reads "Updated just now".
-    const measuredAt = measuredAtOf(stateObj);
-    const measuredMs = parseTimestampMs(measuredAt);
+    // label and time switch to Aqara's report time when the app sends one, so
+    // a reading the FP2 stopped reporting no longer reads "Updated just now".
+    // The newest of the three counts: heart rate and breathing refresh every
+    // few seconds, while sleep_state's time only moves when the stage changes.
+    const measuredMs = Math.max(
+      ...[stateObj, hrObj, brObj]
+        .map((obj) => parseTimestampMs(measuredAtOf(obj)))
+        .filter(Number.isFinite)
+    );
     const showMeasured = !isStale && Number.isFinite(measuredMs);
     const freshness = showMeasured
       ? describeMeasured(Date.now() - measuredMs)
       : describeFreshness(ageMs, isStale);
-    const time = formatTime(showMeasured ? measuredAt : stateObj.last_updated);
+    const time = formatTime(
+      showMeasured ? new Date(measuredMs).toISOString() : stateObj.last_updated
+    );
     // Freshness already names stale data; reserve the extra badge for a
     // distinct state instead of repeating the same warning twice.
     const badge = !isStale && code === 0 ? "not measuring" : "";

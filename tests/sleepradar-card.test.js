@@ -1555,4 +1555,27 @@ function withMeasuredAt(states, measuredAt) {
   card.hass = { states: withMeasuredAt(base, "2026-07-03T07:58:40+00:00") };
   assert.equal(card.shadowRoot.writes, writes + 1, "a new measured_at re-renders the card");
   assert.match(card.shadowRoot.innerHTML, /Measured 2 min ago/);
+
+  // sleep_state's time only moves when the stage changes, so a stage held for
+  // hours must not make live vitals read as old: the newest time counts.
+  const longStage = withMeasuredAt(base, "2026-07-03T05:58:40+00:00");
+  longStage["sensor.aqara_fp2_sleep_heart_rate"] = {
+    ...longStage["sensor.aqara_fp2_sleep_heart_rate"],
+    attributes: { measured_at: "2026-07-03T08:00:35+00:00" },
+  };
+  const newest = render(longStage);
+  assert.match(newest, /Measured just now/, "the newest reading's time names the freshness");
+  assert.doesNotMatch(newest, /Measured 2 hr ago/, "a long-held stage does not age live vitals");
+
+  card.hass = { states: longStage };
+  const before = card.shadowRoot.writes;
+  const breathingMoved = {
+    ...longStage,
+    "sensor.aqara_fp2_sleep_respiration_rate": {
+      ...longStage["sensor.aqara_fp2_sleep_respiration_rate"],
+      attributes: { measured_at: "2026-07-03T08:00:39+00:00" },
+    },
+  };
+  card.hass = { states: breathingMoved };
+  assert.equal(card.shadowRoot.writes, before + 1, "a new breathing measured_at re-renders the card");
 }
