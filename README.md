@@ -73,6 +73,23 @@ each of the past seven nights (`History check, hour ending …`), then heart rat
 hour by hour through one of those nights. It is a diagnostic
 for filling readings missed between polls; nothing is published from it yet.
 
+Four night totals add up the hours since 18:00 (local time; they reset at
+the next 18:00) from Aqara's own timestamps:
+
+| Sensor | What it shows |
+| --- | --- |
+| `sensor.aqara_fp2_sleep_night_asleep` | Hours in any sleep stage (REM, light or deep) |
+| `sensor.aqara_fp2_sleep_night_light_sleep` | Hours of light sleep |
+| `sensor.aqara_fp2_sleep_night_deep_sleep` | Hours of deep sleep |
+| `sensor.aqara_fp2_sleep_night_rem_sleep` | Hours of REM sleep |
+
+Aqara's sleep stage reaches its cloud 7-19 minutes after it happened, so a
+time-in-state count on `sensor.aqara_fp2_sleep_sleep_state` (for example a
+`history_stats` helper) starts and ends late. These totals use the event
+times from Aqara's history log instead. The latest stage change is counted
+only once the next one arrives, so the totals lag during a long stage and are
+exact by morning.
+
 Three diagnostic entities sit alongside them:
 
 | Entity | What it shows |

@@ -130,6 +130,26 @@ STAGE_LABELS = {
     "5": "deep",
 }
 
+# Night totals. Aqara's sleep stage reaches its cloud 7-19 minutes after it
+# happened, so Home Assistant's own time-in-state counts start and end late by
+# different amounts. These totals are computed from Aqara's timestamps instead:
+# the night's stage changes come from the history log, and the time from one
+# change to the next counts toward the earlier change's stage. The latest
+# change's stage is not counted until the next change arrives, so a total
+# never runs ahead of what Aqara has confirmed, and the morning value is
+# exact. The night starts at NIGHT_START_HOUR local time and runs 24 hours.
+NIGHT_START_HOUR = 18
+NIGHT_REBUILD_CHUNK_S = 2 * 3600   # window per request when rebuilding a night
+NIGHT_MIN_CHUNK_S = 10 * 60        # a full page is split down to this window
+NIGHT_REFRESH_WINDOW_S = 3600      # re-read each poll; covers Aqara's upload delay
+NIGHT_TOTALS = [
+    # (state key, object id suffix, name, stage codes, icon)
+    ("night_asleep_h", "night_asleep", "Night asleep", frozenset({"3", "4", "5"}), "mdi:sleep"),
+    ("night_light_h", "night_light_sleep", "Night light sleep", frozenset({"4"}), "mdi:weather-night-partly-cloudy"),
+    ("night_deep_h", "night_deep_sleep", "Night deep sleep", frozenset({"5"}), "mdi:power-sleep"),
+    ("night_rem_h", "night_rem_sleep", "Night REM sleep", frozenset({"3"}), "mdi:eye-outline"),
+]
+
 AREA = os.environ.get("AQARA_AREA", "EU").upper()
 USER = os.environ.get("AQARA_USER", "")
 PASSWORD = os.environ.get("AQARA_PASS", "")
@@ -565,11 +585,48 @@ def publish_discovery(client):
             qos=1,
             retain=True,
         )
+    for key, suffix, name, _codes, icon in NIGHT_TOTALS:
+        client.publish(
+            f"{DISCOVERY_PREFIX}/sensor/{NODE}/{suffix}/config",
+            json.dumps(night_total_discovery_payload(key, suffix, name, icon)),
+            qos=1,
+            retain=True,
+        )
     log(
         "info",
-        f"Published discovery for {len(SENSORS)} sensors and "
-        f"{1 + len(device_status)} diagnostic entities",
+        f"Published discovery for {len(SENSORS)} sensors, {len(NIGHT_TOTALS)} "
+        f"night totals and {1 + len(device_status)} diagnostic entities",
     )
+
+
+def night_total_discovery_payload(key, suffix, name, icon):
+    """Discovery for one night total: hours, from Aqara's own timestamps.
+
+    No force_update: the value only changes when a stage change arrives, so
+    unchanged polls need no Recorder row. It shares the vitals' availability
+    and expiry, since it comes from the same poll.
+    """
+    object_id = f"{NODE}_{suffix}"
+    return {
+        "name": name,
+        "unique_id": object_id,
+        "object_id": object_id,
+        "default_entity_id": f"sensor.{object_id}",
+        "state_topic": STATE_TOPIC,
+        "value_template": "{{ value_json.%s | default('None') }}" % key,
+        "json_attributes_topic": STATE_TOPIC,
+        "json_attributes_template": "{{ {'night_start': value_json.night_start | default(none)} | tojson }}",
+        "unit_of_measurement": "h",
+        "device_class": "duration",
+        "state_class": "measurement",
+        "icon": icon,
+        "availability_topic": AVAIL_TOPIC,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "expire_after": EXPIRE_AFTER,
+        "origin": ORIGIN,
+        "device": DEVICE,
+    }
 
 
 def aqara_time_seconds(raw):
@@ -693,6 +750,99 @@ def has_session(aqara):
     """Whether the client holds a session token. A test double without a
     `token` attribute counts as signed in."""
     return bool(getattr(aqara, "token", True))
+
+
+def night_start(now):
+    """Epoch seconds of the night `now` belongs to: the latest local
+    NIGHT_START_HOUR:00 at or before `now`."""
+    lt = time.localtime(now)
+    start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, NIGHT_START_HOUR, 0, 0, 0, 0, -1))
+    if start > now:
+        start = time.mktime(
+            (lt.tm_year, lt.tm_mon, lt.tm_mday - 1, NIGHT_START_HOUR, 0, 0, 0, 0, -1)
+        )
+    return start
+
+
+class NightStages:
+    """The current night's sleep-stage changes from Aqara's history log, and
+    the hours spent in each stage by Aqara's own timestamps."""
+
+    def __init__(self):
+        self.start = None
+        self.events = {}      # epoch seconds -> stage code
+        self.complete = False
+
+    def update(self, history_log, now):
+        """Read new stage changes. A new night (or one not yet read in full)
+        is rebuilt from its start; otherwise the last hour is re-read, which
+        catches changes Aqara uploads late."""
+        start = night_start(now)
+        if start != self.start:
+            self.start, self.events, self.complete = start, {}, False
+        if not self.complete:
+            self.complete = self._read(history_log, start, now, NIGHT_REBUILD_CHUNK_S)
+        else:
+            self._read(history_log, max(start, now - NIGHT_REFRESH_WINDOW_S), now, NIGHT_REFRESH_WINDOW_S)
+
+    def _read(self, history_log, begin, end, chunk):
+        """Merge the changes between `begin` and `end` in `chunk`-long
+        requests. A full page is split in half until it fits. Returns False
+        when any part could not be read in full."""
+        complete = True
+        t = begin
+        while t < end:
+            stop = min(end, t + chunk)
+            res = _history_request(history_log, SLEEP_STATE_ID, int(t * 1000), end_ms=int(stop * 1000))
+            readings, page, problem = history_readings(res, SLEEP_STATE_ID)
+            if problem:
+                log("debug", f"night totals: stage history unavailable ({problem})")
+                return False
+            if page >= HISTORY_CHECK_PAGE_SIZE and stop - t > NIGHT_MIN_CHUNK_S:
+                complete = self._read(history_log, t, stop, (stop - t) / 2) and complete
+            else:
+                if page >= HISTORY_CHECK_PAGE_SIZE:
+                    complete = False
+                for seconds, value in readings:
+                    code = code_string(value)
+                    if code is not None and t - 1 <= seconds <= stop + 1:
+                        self.events[seconds] = code
+            t = stop
+        return complete
+
+    def totals(self):
+        """{state key: hours} for NIGHT_TOTALS, or None until the night has
+        been read in full. Each change's stage counts until the next change;
+        the latest change is open and not counted yet."""
+        if not self.complete:
+            return None
+        ordered = sorted(self.events.items())
+        hours = {key: 0.0 for key, *_ in NIGHT_TOTALS}
+        for (begin, code), (end, _next) in zip(ordered, ordered[1:]):
+            for key, _suffix, _name, codes, _icon in NIGHT_TOTALS:
+                if code in codes:
+                    hours[key] += (end - begin) / 3600
+        return {key: round(value, 3) for key, value in hours.items()}
+
+
+def apply_night_totals(state, night, aqara, now=None):
+    """Update `night` from the history log and add its totals to `state`.
+    Never raises: a failure leaves the totals unknown for this poll."""
+    totals = None
+    history_log = getattr(aqara, "history_log", None)
+    if history_log is not None:
+        try:
+            night.update(history_log, time.time() if now is None else now)
+            totals = night.totals()
+        except Exception as err:  # noqa: BLE001 - totals must not stop polling
+            log("debug", f"night totals failed: {type(err).__name__}: {err}")
+    for key, *_ in NIGHT_TOTALS:
+        state[key] = totals.get(key) if totals else None
+    state["night_start"] = (
+        datetime.fromtimestamp(night.start, timezone.utc).isoformat(timespec="seconds")
+        if night.start is not None
+        else None
+    )
 
 
 def history_readings(res, resource_id):
@@ -1439,6 +1589,8 @@ def main():
     last_device_status = None
     # The history log is checked once per run, after the first good poll.
     history_checked = False
+    # Tonight's stage changes, for the night totals.
+    night = NightStages()
 
     while _running:
         # Aqara has rejected these credentials. Retrying at the poll interval
@@ -1476,6 +1628,7 @@ def main():
 
         if res.get("code") == 0 and isinstance(res.get("result"), list):
             state, mode, offline = build_state(res["result"])
+            apply_night_totals(state, night, aqara)
             client.publish(STATE_TOPIC, json.dumps(state), qos=0, retain=False)
             client.publish(AVAIL_TOPIC, "online", qos=1, retain=True)
             ok = True

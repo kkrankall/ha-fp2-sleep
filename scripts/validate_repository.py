@@ -3405,6 +3405,17 @@ def check_history_check() -> None:
         states = [p for topic, p in published if topic == module.STATE_TOPIC]
         if len(states) != 3:
             fail(f"the history check must not stop polling (raising={raising}): {len(states)} polls")
+        # The night totals read the stage history before the first publish
+        # and again on later polls; keep only the one-time check's requests.
+        first = next(i for i, c in enumerate(calls) if c[2] is None)
+        expected = (
+            len(module.HISTORY_RESOURCE_IDS) + 1
+            + module.HISTORY_NIGHTS * len(module.HISTORY_RESOURCE_IDS)
+            + module.HISTORY_SCAN_HOURS
+        )
+        if any(c[0] != (module.SLEEP_STATE_ID,) for c in calls[:first] + calls[first + expected:]):
+            fail("requests outside the one-time check must be the night totals' stage reads")
+        calls[:] = calls[first:first + expected]
         recent = [c for c in calls if c[2] is None]
         stage = calls[len(recent)]
         scan = calls[-module.HISTORY_SCAN_HOURS:]
@@ -3462,6 +3473,135 @@ def check_history_check() -> None:
         for level, msg in logged:
             if level != "debug" and "lumi1." in msg:
                 fail(f"the sensor id may only be logged at debug level: [{level}] {msg}")
+
+
+def check_night_totals() -> None:
+    """Night totals come from Aqara's own stage timestamps: each change's
+    stage counts until the next change, the latest change stays open, the
+    night starts at 18:00 local, and a failure never stops polling."""
+    module = load_poller_module("poller_night_totals")
+    lt = module.time.localtime
+    mk = lambda y, m, d, h, mi=0: module.time.mktime((y, m, d, h, mi, 0, 0, 0, -1))  # noqa: E731
+
+    # The night a moment belongs to.
+    for moment, want in (
+        (mk(2026, 11, 19, 7), mk(2026, 11, 18, 18)),
+        (mk(2026, 11, 19, 19), mk(2026, 11, 19, 18)),
+        (mk(2026, 11, 19, 18), mk(2026, 11, 19, 18)),
+        (mk(2026, 12, 1, 3), mk(2026, 11, 30, 18)),
+    ):
+        if module.night_start(moment) != want:
+            fail(f"night_start({lt(moment)[:5]}) = {lt(module.night_start(moment))[:5]}")
+
+    start = mk(2026, 11, 18, 18)
+    m = lambda minutes: start + 150 * 60 + minutes * 60  # noqa: E731 - 20:30 + minutes
+    timeline = [(m(-30), "2"), (m(0), "4"), (m(60), "5"), (m(90), "4"), (m(90.5), "4"),
+                (m(120), "3"), (m(130), "4"), (m(150), "0")]
+
+    def make_log(events, page_full_over=None, fail_reads=False, seen=None):
+        def history_log(did, resource_ids, start_ms, end_ms=None):
+            if seen is not None:
+                seen.append((start_ms / 1000, end_ms / 1000))
+            if fail_reads:
+                return {"code": 755, "message": "no permission"}
+            inside = [
+                {"resourceId": "13.106.85", "timeStamp": int(t * 1000), "value": code}
+                for t, code in events
+                if start_ms / 1000 <= t <= end_ms / 1000
+            ]
+            if page_full_over is not None and end_ms / 1000 - start_ms / 1000 > page_full_over:
+                # A full page: Aqara cut it off, so the window must be split.
+                inside = [{"resourceId": "13.106.85", "timeStamp": int(start_ms), "value": "4"}] * 300
+            return {"code": 0, "result": {"data": list(reversed(inside))}}
+        return history_log
+
+    # Rebuild from 18:00 in two-hour windows, then totals by Aqara's times.
+    now = m(200)
+    seen = []
+    night = module.NightStages()
+    night.update(make_log(timeline, seen=seen), now)
+    contiguous = all(abs(b_end - a_start) <= 1 for (_, b_end), (a_start, _) in zip(seen, seen[1:]))
+    if (
+        not night.complete
+        or seen[0][0] != start
+        or abs(seen[-1][1] - now) > 1
+        or not contiguous
+        or any(b - a > module.NIGHT_REBUILD_CHUNK_S for a, b in seen)
+    ):
+        fail(f"a new night must be read from 18:00 to now in windows of at most 2 h: {seen}")
+    totals = night.totals()
+    want = {"night_asleep_h": 2.5, "night_light_h": 1.833, "night_deep_h": 0.5, "night_rem_h": 0.167}
+    if totals != want:
+        fail(f"night totals must follow Aqara's timestamps: {totals} != {want}")
+
+    # A late upload inside the last hour is merged on the next poll, and the
+    # latest change stays open until the one after it arrives.
+    late = timeline[:-1]
+    night = module.NightStages()
+    night.update(make_log(late), m(145))
+    open_totals = night.totals()
+    if open_totals["night_asleep_h"] != round(130 / 60, 3):
+        fail(f"the latest change must not be counted until the next one arrives: {open_totals}")
+    seen = []
+    night.update(make_log(timeline, seen=seen), m(170))
+    if len(seen) != 1 or abs(seen[0][1] - seen[0][0] - module.NIGHT_REFRESH_WINDOW_S) > 1:
+        fail(f"a read night must only re-read the last hour: {seen}")
+    if night.totals() != want:
+        fail(f"a late stage change must be merged: {night.totals()}")
+
+    # A new night starts over.
+    night.update(make_log([]), mk(2026, 11, 19, 18, 30))
+    if night.totals() != {k: 0.0 for k in want}:
+        fail(f"a new night must start from zero: {night.totals()}")
+
+    # A rejected read leaves the totals unknown, and a full page is split.
+    night = module.NightStages()
+    night.update(make_log(timeline, fail_reads=True), now)
+    if night.totals() is not None:
+        fail("totals must stay unknown until the night has been read in full")
+    seen = []
+    night = module.NightStages()
+    night.update(make_log(timeline, page_full_over=1800, seen=seen), now)
+    if not night.complete or night.totals() != want or not any(b - a <= 1800 for a, b in seen):
+        fail(f"a full page must be split into smaller windows: complete={night.complete} {night.totals()}")
+
+    # apply_night_totals: no history log, a working one, a raising one.
+    class NoLog:
+        pass
+
+    class RaisingLog:
+        def history_log(self, *args, **kwargs):
+            raise OSError("reset")
+
+    class WorkingLog:
+        history_log = staticmethod(make_log(timeline))
+
+    for client, expect in ((NoLog(), None), (RaisingLog(), None), (WorkingLog(), want)):
+        state = {}
+        module.apply_night_totals(state, module.NightStages(), client, now=now)
+        got = {k: state.get(k) for k in want}
+        if (expect is None and any(v is not None for v in got.values())) or (expect and got != expect):
+            fail(f"apply_night_totals with {type(client).__name__}: {got}")
+        want_start = module.datetime.fromtimestamp(start, module.timezone.utc).isoformat(timespec="seconds")
+        if type(client).__name__ != "NoLog" and state.get("night_start") != want_start:
+            fail(f"night_start must be published in UTC: {state.get('night_start')} != {want_start}")
+
+    # Discovery: hours, duration, measurement, no force_update, diagnostic-free.
+    ids = set()
+    for key, suffix, name, _codes, icon in module.NIGHT_TOTALS:
+        payload = module.night_total_discovery_payload(key, suffix, name, icon)
+        ids.add(payload["default_entity_id"])
+        if payload.get("unit_of_measurement") != "h" or payload.get("device_class") != "duration":
+            fail(f"{suffix} must be a duration in hours")
+        if payload.get("state_class") != "measurement" or "force_update" in payload:
+            fail(f"{suffix} must be a measurement without force_update")
+        if payload.get("state_topic") != module.STATE_TOPIC or key not in payload.get("value_template", ""):
+            fail(f"{suffix} must read {key} from the state topic")
+        if private_string_matches("night total discovery", json.dumps(payload)):
+            fail("night total discovery contains private/local naming")
+    if ids != {f"sensor.aqara_fp2_sleep_{s}" for s in
+               ("night_asleep", "night_light_sleep", "night_deep_sleep", "night_rem_sleep")}:
+        fail(f"unexpected night total entity ids: {sorted(ids)}")
 
 
 def check_notification_failure_is_soft() -> None:
@@ -5280,6 +5420,7 @@ def main(argv: list[str] | None = None) -> None:
     check_transient_query_keeps_session()
     check_measurement_time_and_device_status()
     check_history_check()
+    check_night_totals()
     check_notification_failure_is_soft()
     validate_run_script()
     validate_examples()
