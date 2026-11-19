@@ -2,6 +2,7 @@
 """Poll Aqara FP2 sleep telemetry and publish Home Assistant MQTT discovery."""
 
 from base64 import b64encode
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -70,6 +71,17 @@ SLEEP_OPTIONS = [
     "set_device_mode4",
     "device_offline_status",
 ]
+
+# The FP2's operating mode and offline flag ride along in the same query. The
+# vitals only mean something while the FP2 is online and in Sleep Monitoring
+# mode, so both are published as diagnostic entities. Aqara does not document
+# the codes; this mapping follows the community AqaraPOST Node-RED flow
+# (github.com/sdavides/AqaraPOST-Homeassistant). Unmapped codes are shown raw.
+MODE_ATTR = "set_device_mode4"
+OFFLINE_ATTR = "device_offline_status"
+DEVICE_MODES = {"3": "Zone detection", "5": "Fall detection", "9": "Sleep monitoring"}
+SLEEP_MONITOR_MODE = "9"
+ONLINE_STATES = {"0": "ON", "1": "OFF"}
 
 AREA = os.environ.get("AQARA_AREA", "EU").upper()
 USER = os.environ.get("AQARA_USER", "")
@@ -162,6 +174,8 @@ PROBLEM_STATE_TOPIC = f"aqara/{NODE}/problem"
 PROBLEM_ATTR_TOPIC = f"aqara/{NODE}/problem/attributes"
 PROBLEM_OBJECT_ID = f"{NODE}_connection_problem"
 NOTIFICATION_ID = f"{NODE}_connection_problem"
+MODE_OBJECT_ID = f"{NODE}_fp2_mode"
+ONLINE_OBJECT_ID = f"{NODE}_fp2_online"
 DEVICE = {
     "identifiers": [f"aqara_fp2_sleep_{NODE}"],
     "name": DEVICE_NAME or "Aqara FP2 Sleep Monitor",
@@ -368,6 +382,14 @@ def discovery_payload(
         # Card's last_updated-based "stale" badge false-positive during
         # entirely normal operation.
         "force_update": True,
+        # force_update also means last_updated only proves the poller is
+        # alive. Aqara stamps each reading with the time it was measured, so
+        # that time rides along as the `measured_at` attribute.
+        "json_attributes_topic": STATE_TOPIC,
+        "json_attributes_template": (
+            "{{ {'measured_at': (value_json.measured_at | default({})).get('%s')}"
+            " | tojson }}" % attr
+        ),
         "origin": ORIGIN,
         "device": DEVICE,
     }
@@ -411,6 +433,47 @@ def problem_discovery_payload():
     }
 
 
+def device_status_discovery_payloads():
+    """Discovery for the FP2's mode and online state, keyed by component.
+
+    Both read the vitals' state topic and share their availability and
+    expiry: they describe the same reply, so they go stale with it.
+    """
+    common = {
+        "state_topic": STATE_TOPIC,
+        "availability_topic": AVAIL_TOPIC,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "expire_after": EXPIRE_AFTER,
+        "entity_category": "diagnostic",
+        "origin": ORIGIN,
+        "device": DEVICE,
+    }
+    mode = {
+        "name": "FP2 mode",
+        "unique_id": f"{NODE}_fp2_mode",
+        "object_id": MODE_OBJECT_ID,
+        "default_entity_id": f"sensor.{MODE_OBJECT_ID}",
+        "value_template": "{{ value_json.device_mode | default('unknown') }}",
+        "icon": "mdi:radar",
+        **common,
+    }
+    online = {
+        "name": "FP2 online",
+        "unique_id": f"{NODE}_fp2_online",
+        "object_id": ONLINE_OBJECT_ID,
+        "default_entity_id": f"binary_sensor.{ONLINE_OBJECT_ID}",
+        # An unreported flag renders "None", which Home Assistant reads as
+        # unknown rather than offline.
+        "value_template": "{{ value_json.fp2_online | default('None') }}",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "device_class": "connectivity",
+        **common,
+    }
+    return {("sensor", "fp2_mode"): mode, ("binary_sensor", "fp2_online"): online}
+
+
 def publish_discovery(client):
     for attr, object_id, uid_suffix, name, unit, sc, dc, icon in SENSORS:
         topic = f"{DISCOVERY_PREFIX}/sensor/{NODE}/{uid_suffix}/config"
@@ -424,10 +487,142 @@ def publish_discovery(client):
         qos=1,
         retain=True,
     )
+    device_status = device_status_discovery_payloads()
+    for (component, suffix), payload in device_status.items():
+        client.publish(
+            f"{DISCOVERY_PREFIX}/{component}/{NODE}/{suffix}/config",
+            json.dumps(payload),
+            qos=1,
+            retain=True,
+        )
     log(
         "info",
-        f"Published discovery for {len(SENSORS)} sensors and 1 diagnostic entity",
+        f"Published discovery for {len(SENSORS)} sensors and "
+        f"{1 + len(device_status)} diagnostic entities",
     )
+
+
+def aqara_time_seconds(raw):
+    """Aqara's `timeStamp` (epoch milliseconds) as epoch seconds, or None.
+
+    Seconds are accepted as well. A value that is not a plain number, or that
+    lands outside 2001-2096, reads as no timestamp rather than a wrong one.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not (raw.isascii() and raw.isdigit()):
+            return None
+        raw = int(raw)
+    if not isinstance(raw, (int, float)):
+        return None
+    seconds = raw / 1000 if raw >= 1e11 else raw
+    if not 1e9 <= seconds <= 4e9:
+        return None
+    return float(seconds)
+
+
+def aqara_time_iso(raw):
+    """Aqara's `timeStamp` as ISO 8601 UTC, or None."""
+    seconds = aqara_time_seconds(raw)
+    if seconds is None:
+        return None
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="seconds")
+
+
+def code_string(raw):
+    """A small integer code, sent by Aqara as a number or a string, as its
+    decimal string, or None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw.isascii() and raw.isdigit():
+            return str(int(raw))
+    return None
+
+
+def describe_mode(mode):
+    """The FP2 mode's label, the raw code when unmapped, or None."""
+    if mode is None:
+        return None
+    return DEVICE_MODES.get(mode, f"Unknown ({mode})")
+
+
+def build_state(items):
+    """(state payload, mode code, offline code) from a res/query result list.
+
+    Entries that are not objects with a string `attr` are skipped, so an
+    off-contract entry cannot end the poll loop.
+    """
+    readings = {
+        item["attr"]: item
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("attr"), str)
+    }
+    state = {attr: readings.get(attr, {}).get("value") for attr, *_ in SENSORS}
+    state["measured_at"] = {
+        attr: aqara_time_iso(readings.get(attr, {}).get("timeStamp"))
+        for attr, *_ in SENSORS
+    }
+    mode = code_string(readings.get(MODE_ATTR, {}).get("value"))
+    offline = code_string(readings.get(OFFLINE_ATTR, {}).get("value"))
+    state["device_mode"] = describe_mode(mode)
+    state["fp2_online"] = ONLINE_STATES.get(offline)
+    return state, mode, offline
+
+
+def describe_reply_fields(items, now=None):
+    """One log line naming the fields Aqara's readings carry and how old each
+    measurement is. Field names and ages only: the reply also carries the
+    sensor's id, which stays out of non-debug logs."""
+    now = time.time() if now is None else now
+    entries = [item for item in items if isinstance(item, dict)]
+    fields = ", ".join(sorted({plain_text(key)[:40] for e in entries for key in e}))
+    ages = {}
+    for entry in entries:
+        seconds = aqara_time_seconds(entry.get("timeStamp"))
+        if seconds is not None:
+            ages[plain_text(entry.get("attr"))[:40]] = round(now - seconds)
+    if not ages:
+        return (
+            f"Aqara readings carry the fields: {fields or 'none'}. None has a "
+            "usable timeStamp, so measured_at stays empty."
+        )
+    age_text = ", ".join(f"{attr} {age}s" for attr, age in sorted(ages.items()))
+    return (
+        f"Aqara readings carry the fields: {fields}. Measurement age per "
+        f"reading: {age_text}."
+    )
+
+
+def device_status_message(mode, offline):
+    """(level, text) describing the FP2's mode and online flag."""
+    mode_text = describe_mode(mode) or "not reported"
+    if offline == "1":
+        return (
+            "warning",
+            f"Aqara reports the FP2 offline (mode: {mode_text}). Readings stop "
+            "changing until it reconnects.",
+        )
+    if mode is not None and mode != SLEEP_MONITOR_MODE:
+        return (
+            "warning",
+            f"The FP2 is in {mode_text} mode, not Sleep monitoring. Heart rate, "
+            "breathing and sleep state stay empty or stale until it is switched "
+            "back in the Aqara Home app.",
+        )
+    online_text = {"0": "online"}.get(offline, "online state not reported")
+    return "info", f"FP2 mode: {mode_text}; {online_text}."
+
+
+def has_session(aqara):
+    """Whether the client holds a session token. A test double without a
+    `token` attribute counts as signed in."""
+    return bool(getattr(aqara, "token", True))
 
 
 def publish_problem(client, problem, cause=None, code=None, last_success=None):
@@ -931,6 +1126,11 @@ def main():
 
     auth_wait = 0
     auth_delay = AUTH_RETRY_BACKOFF
+    # The reply's field names and measurement ages are logged once per run,
+    # so users can see what Aqara actually sends without debug logging.
+    reply_fields_logged = False
+    # The FP2's (mode, offline) codes, logged whenever they change.
+    last_device_status = None
 
     while _running:
         # Aqara has rejected these credentials. Retrying at the poll interval
@@ -943,10 +1143,22 @@ def main():
 
         ok = False
         res = aqara.res_query(SUBJECT, SLEEP_OPTIONS)
-        if res.get("code") != 0:
+        code = res.get("code")
+        if code != 0 and is_transient_code(code) and has_session(aqara):
+            # Aqara did not answer (network, timeout, 429 or 5xx), so the
+            # session says nothing about it. Signing in again would add load
+            # to a server that is already failing or rate-limiting, and each
+            # new sign-in can end another client's session on the same
+            # account. Keep the session; Health counts this as transient.
             log(
                 "warning",
-                f"res/query code={code_text(res.get('code'))} ({aqara_error_text(res)}); re-login",
+                f"res/query code={code_text(code)} ({aqara_error_text(res)}); "
+                "Aqara did not answer, keeping the session",
+            )
+        elif code != 0:
+            log(
+                "warning",
+                f"res/query code={code_text(code)} ({aqara_error_text(res)}); re-login",
             )
             login_ok = aqara.login()
             if login_ok:
@@ -955,13 +1167,17 @@ def main():
                 res = last_error(aqara) or res
 
         if res.get("code") == 0 and isinstance(res.get("result"), list):
-            values = {
-                item["attr"]: item["value"] for item in res["result"] if "attr" in item
-            }
-            state = {attr: values.get(attr) for attr, *_ in SENSORS}
+            state, mode, offline = build_state(res["result"])
             client.publish(STATE_TOPIC, json.dumps(state), qos=0, retain=False)
             client.publish(AVAIL_TOPIC, "online", qos=1, retain=True)
             ok = True
+            if not reply_fields_logged:
+                log("info", describe_reply_fields(res["result"]))
+                reply_fields_logged = True
+            if (mode, offline) != last_device_status:
+                level, message = device_status_message(mode, offline)
+                log(level, message)
+                last_device_status = (mode, offline)
             log("debug", f"state={state}")
 
         if ok:

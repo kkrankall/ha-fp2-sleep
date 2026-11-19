@@ -3015,6 +3015,230 @@ def check_auth_backoff_schedule() -> None:
         fail(f"auth backoff exceeded its cap: {max(gaps)}s")
 
 
+def _drive_poll_loop(module, aqara_cls, polls):
+    """Run the real main() for `polls` loop passes with stubbed MQTT.
+
+    Returns (published, logged): every client.publish call and every log line.
+    """
+    published, logged = [], []
+    remaining = {"polls": polls}
+
+    class FakeClient:
+        def publish(self, topic, payload=None, qos=0, retain=False):
+            published.append((topic, payload))
+
+        def loop_stop(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+    def fake_sleep(seconds):
+        remaining["polls"] -= 1
+        if remaining["polls"] <= 0:
+            module._running = False
+        return module._running
+
+    module.make_mqtt = lambda: FakeClient()
+    module.publish_discovery = lambda client: None
+    module.Aqara = aqara_cls
+    module.interruptible_sleep = fake_sleep
+    module.log = lambda level, msg: logged.append((level, msg))
+    module.notify_problem = lambda cause: True
+    module.clear_problem_notification = lambda: True
+    module.USER, module.PASSWORD, module.SUBJECT = "u", "p", "did"
+    module._running = True
+    module.main()
+    return published, logged
+
+
+def check_transient_query_keeps_session() -> None:
+    """A query Aqara did not answer must not trigger a fresh sign-in.
+
+    Network errors, 429 and 5xx say nothing about the session. Signing in
+    again on them adds load to a failing or rate-limiting server and can end
+    another client's session on the same account. A session Aqara rejected,
+    or no session at all, still signs in again.
+    """
+    module = load_poller_module("poller_transient_session")
+    logins = []
+    replies = [
+        {"code": -1, "message": "URLError: timed out"},
+        {"code": 429, "message": "HTTP 429"},
+        {"code": 503, "message": "HTTP 503"},
+    ]
+
+    class SignedInAqara:
+        def __init__(self, area):
+            self.last_error = None
+            self.token = None
+
+        def login(self):
+            logins.append("login")
+            self.token = "t"
+            return True
+
+        def res_query(self, did, options):
+            return replies.pop(0) if replies else {"code": -1, "message": "m"}
+
+    _published, logged = _drive_poll_loop(module, SignedInAqara, 3)
+    if logins != ["login"]:
+        fail(
+            "a query Aqara did not answer must keep the session instead of "
+            f"signing in again: {len(logins)} sign-ins"
+        )
+    if not any(
+        level == "warning" and "keeping the session" in msg for level, msg in logged
+    ):
+        fail(f"a kept session must be logged: {logged}")
+
+    # Without a session (the startup sign-in failed), the same failure must
+    # still sign in again, or the poller would never recover.
+    module = load_poller_module("poller_transient_no_session")
+    logins.clear()
+
+    class SignedOutAqara(SignedInAqara):
+        def login(self):
+            logins.append("login")
+            self.last_error = {"code": -1, "message": "URLError: timed out"}
+            return False
+
+        def res_query(self, did, options):
+            return {"code": -1, "message": "URLError: timed out"}
+
+    _drive_poll_loop(module, SignedOutAqara, 2)
+    if len(logins) < 3:
+        fail(
+            "without a session, a query Aqara did not answer must sign in "
+            f"again: {len(logins)} sign-ins"
+        )
+
+
+def check_measurement_time_and_device_status() -> None:
+    """Aqara's timestamps, the FP2 mode and its online flag reach Home
+    Assistant, and an off-contract entry cannot end the poll loop."""
+    module = load_poller_module("poller_measurement_time")
+
+    ms = 1_763_520_000_000
+    want = "2025-11-19T02:40:00+00:00"
+    for raw in (ms, str(ms), f" {ms} ", ms // 1000, float(ms)):
+        if module.aqara_time_iso(raw) != want:
+            fail(f"aqara_time_iso({raw!r}) = {module.aqara_time_iso(raw)!r}, want {want}")
+    for raw in (None, True, False, "", "abc", "²", "-5", 0, 12, 5e13, float("nan"), [], {}):
+        if module.aqara_time_iso(raw) is not None:
+            fail(f"aqara_time_iso({raw!r}) must be None, got {module.aqara_time_iso(raw)!r}")
+
+    items = [
+        {"subjectId": "lumi1.0123456789ab", "attr": "heartrate_value", "value": "61", "timeStamp": ms},
+        {"subjectId": "lumi1.0123456789ab", "attr": "sleep_state", "value": "4", "timeStamp": str(ms)},
+        {"subjectId": "lumi1.0123456789ab", "attr": "set_device_mode4", "value": "9", "timeStamp": ms},
+        {"subjectId": "lumi1.0123456789ab", "attr": "device_offline_status", "value": 0, "timeStamp": ms},
+        "not an object",
+        {"value": "12"},
+        {"attr": 5, "value": "x"},
+        {"attr": "respiration_rate_value"},
+    ]
+    state, mode, offline = module.build_state(items)
+    if state.get("heartrate_value") != "61" or state.get("sleep_state") != "4":
+        fail(f"build_state lost a reading: {state}")
+    if state.get("respiration_rate_value") is not None:
+        fail(f"a reading without a value must publish null: {state}")
+    measured = state.get("measured_at") or {}
+    if measured.get("heartrate_value") != want or measured.get("sleep_state") != want:
+        fail(f"build_state must publish each reading's measured_at: {measured}")
+    if measured.get("lux") is not None:
+        fail(f"a missing reading has no measured_at: {measured}")
+    if (mode, offline) != ("9", "0"):
+        fail(f"build_state mode/offline codes: {(mode, offline)}")
+    if state.get("device_mode") != "Sleep monitoring" or state.get("fp2_online") != "ON":
+        fail(f"build_state device status: {state}")
+    if json.loads(json.dumps(state)) != state:
+        fail("the state payload must be JSON")
+
+    for codes, label, online in (
+        (("3", "1"), "Zone detection", "OFF"),
+        (("5", None), "Fall detection", None),
+        (("7", "2"), "Unknown (7)", None),
+        ((None, None), None, None),
+    ):
+        entries = []
+        if codes[0] is not None:
+            entries.append({"attr": "set_device_mode4", "value": codes[0]})
+        if codes[1] is not None:
+            entries.append({"attr": "device_offline_status", "value": codes[1]})
+        got, _m, _o = module.build_state(entries)
+        if got["device_mode"] != label or got["fp2_online"] != online:
+            fail(f"device status for {codes}: {got['device_mode']!r}, {got['fp2_online']!r}")
+
+    if module.device_status_message("9", "0")[0] != "info":
+        fail("Sleep monitoring and online must log at info")
+    if module.device_status_message("3", "0")[0] != "warning":
+        fail("a mode other than Sleep monitoring must log a warning")
+    if module.device_status_message("9", "1")[0] != "warning":
+        fail("an offline FP2 must log a warning")
+
+    line = module.describe_reply_fields(items, now=ms / 1000 + 90)
+    if "lumi1." in line or "\n" in line:
+        fail(f"the reply-fields line must not carry the sensor id: {line}")
+    if "timeStamp" not in line or "heartrate_value 90s" not in line:
+        fail(f"the reply-fields line must name the fields and ages: {line}")
+    if "usable timeStamp" not in module.describe_reply_fields([{"attr": "lux", "value": 1}]):
+        fail("a reply without timestamps must say so")
+
+    # Discovery: every vital carries measured_at, and the device status
+    # entities are diagnostic and share the vitals' topic and expiry.
+    for sensor in module.SENSORS:
+        payload = module.discovery_payload(*sensor)
+        if payload.get("json_attributes_topic") != module.STATE_TOPIC:
+            fail(f"{payload['object_id']} must read attributes from the state topic")
+        if f"'{sensor[0]}'" not in payload.get("json_attributes_template", ""):
+            fail(f"{payload['object_id']} must expose its own measured_at")
+    status = module.device_status_discovery_payloads()
+    if set(status) != {("sensor", "fp2_mode"), ("binary_sensor", "fp2_online")}:
+        fail(f"unexpected device status entities: {sorted(status)}")
+    for payload in status.values():
+        if payload.get("entity_category") != "diagnostic":
+            fail(f"{payload['object_id']} must be a diagnostic entity")
+        if payload.get("state_topic") != module.STATE_TOPIC:
+            fail(f"{payload['object_id']} must read the vitals' state topic")
+        if payload.get("expire_after") != module.EXPIRE_AFTER:
+            fail(f"{payload['object_id']} must expire with the vitals")
+        if private_string_matches("device status discovery", json.dumps(payload)):
+            fail("device status discovery contains private/local naming")
+    if status[("binary_sensor", "fp2_online")].get("device_class") != "connectivity":
+        fail("FP2 online must be a connectivity sensor")
+
+    # Through main(): the state carries measured_at, the field line is
+    # logged once per run, and an unchanged device status is not re-logged.
+    module = load_poller_module("poller_measurement_loop")
+
+    class ReadingAqara:
+        def __init__(self, area):
+            self.last_error = None
+            self.token = None
+
+        def login(self):
+            self.token = "t"
+            return True
+
+        def res_query(self, did, options):
+            return {"code": 0, "result": list(items)}
+
+    published, logged = _drive_poll_loop(module, ReadingAqara, 3)
+    states = [json.loads(p) for topic, p in published if topic == module.STATE_TOPIC]
+    if len(states) != 3 or states[0].get("measured_at", {}).get("heartrate_value") != want:
+        fail(f"main() must publish measured_at on every poll: {states[:1]}")
+    field_lines = [msg for level, msg in logged if "Aqara readings carry the fields" in msg]
+    if len(field_lines) != 1:
+        fail(f"the reply-fields line must be logged once per run: {field_lines}")
+    status_lines = [msg for level, msg in logged if msg.startswith("FP2 mode:")]
+    if len(status_lines) != 1:
+        fail(f"an unchanged device status must not be logged again: {status_lines}")
+    for level, msg in logged:
+        if level != "debug" and "lumi1." in msg:
+            fail(f"the sensor id may only be logged at debug level: [{level}] {msg}")
+
+
 def check_notification_failure_is_soft() -> None:
     """Losing a notification must never take the poller down."""
     module = load_poller_module("poller_notify_soft")
@@ -4828,6 +5052,8 @@ def main(argv: list[str] | None = None) -> None:
     check_problem_entity_is_independent()
     check_health_grace_and_notifications()
     check_auth_backoff_schedule()
+    check_transient_query_keeps_session()
+    check_measurement_time_and_device_status()
     check_notification_failure_is_soft()
     validate_run_script()
     validate_examples()

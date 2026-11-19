@@ -60,6 +60,22 @@ SleepRadar creates five MQTT sensors in Home Assistant:
 | `sensor.aqara_fp2_sleep_body_movement` | Body movement value | Sensor-reported measurement |
 | `sensor.aqara_fp2_sleep_illuminance` | Illuminance in lux | Sensor-reported measurement |
 
+Each of the five carries a `measured_at` attribute: the time Aqara says it took
+that reading. A sensor's `last_updated` only shows that SleepRadar polled, so
+use `measured_at` to tell how old a reading is.
+
+Three diagnostic entities sit alongside them:
+
+| Entity | What it shows |
+| --- | --- |
+| `binary_sensor.aqara_fp2_sleep_connection_problem` | Whether SleepRadar can get data from Aqara, and why not (see [Know When It Stops](#know-when-it-stops)) |
+| `sensor.aqara_fp2_sleep_fp2_mode` | The FP2's mode: Sleep monitoring, Zone detection or Fall detection. The vitals only mean something in Sleep monitoring |
+| `binary_sensor.aqara_fp2_sleep_fp2_online` | Whether Aqara reports the FP2 online |
+
+The mode and online codes are not documented by Aqara. SleepRadar uses the
+mapping from the community [AqaraPOST](https://github.com/sdavides/AqaraPOST-Homeassistant)
+flow and shows an unmapped mode as `Unknown (code)`.
+
 ## Before You Start
 
 You need:
@@ -480,7 +496,8 @@ did not record stays missing.
 
 ### Values Stay Unknown
 
-- The FP2 is in Sleep Monitor mode.
+- The FP2 is in Sleep Monitor mode: `sensor.aqara_fp2_sleep_fp2_mode` reads
+  Sleep monitoring, and the app log warns when it does not.
 - `subject_id` points to the sleep FP2, not another Aqara device.
 - The Aqara Home app still shows current sleep data for that FP2.
 

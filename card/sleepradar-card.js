@@ -132,6 +132,20 @@ function describeFreshness(ageMs, isStale) {
   return `${isStale ? "Stale" : "Updated"} ${age}`;
 }
 
+// Aqara's own measurement time, published by the app as the `measured_at`
+// attribute. last_updated only proves the poller is alive (force_update), so
+// when this is present the header names the measurement's age instead.
+function measuredAtOf(stateObj) {
+  const attributes = stateObj && stateObj.attributes;
+  const value = attributes && attributes.measured_at;
+  return typeof value === "string" ? value : null;
+}
+
+function describeMeasured(ageMs) {
+  const age = formatAge(Math.max(0, ageMs));
+  return age ? `Measured ${age}` : "Measurement time unknown";
+}
+
 function describeVitalStatus(code, isFresh, isStale, value, occupancyConfirmed) {
   if (isInBedCode(code) && isFresh && value !== null) return "Live now";
   if (isInBedCode(code) && isFresh) return "No value reported";
@@ -349,7 +363,7 @@ class SleepradarCard extends HTMLElement {
     const darkMode = this._hass.themes && this._hass.themes.darkMode;
     const signatureValues = [
       typeof darkMode === "boolean" ? darkMode : null,
-      stateObj && [stateObj.state, stateObj.last_updated],
+      stateObj && [stateObj.state, stateObj.last_updated, measuredAtOf(stateObj)],
       hrObj && [hrObj.state, hrObj.last_updated],
       brObj && [brObj.state, brObj.last_updated],
     ];
@@ -435,8 +449,16 @@ class SleepradarCard extends HTMLElement {
     const shownHr = canShowLiveVitals ? hr : null;
     const shownBr = canShowLiveVitals ? br : null;
 
-    const freshness = describeFreshness(ageMs, isStale);
-    const time = formatTime(stateObj.last_updated);
+    // Hiding and the stale badge still follow the poller (last_updated). The
+    // label and time switch to Aqara's measurement time when the app sends
+    // one, so a reading Aqara took long ago no longer reads "Updated just now".
+    const measuredAt = measuredAtOf(stateObj);
+    const measuredMs = parseTimestampMs(measuredAt);
+    const showMeasured = !isStale && Number.isFinite(measuredMs);
+    const freshness = showMeasured
+      ? describeMeasured(Date.now() - measuredMs)
+      : describeFreshness(ageMs, isStale);
+    const time = formatTime(showMeasured ? measuredAt : stateObj.last_updated);
     // Freshness already names stale data; reserve the extra badge for a
     // distinct state instead of repeating the same warning twice.
     const badge = !isStale && code === 0 ? "not measuring" : "";

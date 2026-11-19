@@ -1496,3 +1496,63 @@ for (const pollIntervalSeconds of [60, 20]) {
   assert.equal(intervals.size, 0, "the replacement timer is also cleaned up");
 }
 clockMs = RealDate.parse(NOW);
+
+// Aqara's measurement time (the app's `measured_at` attribute) names the
+// reading's age. Hiding and the stale badge still follow the poller.
+function withMeasuredAt(states, measuredAt) {
+  const sleepState = states["sensor.aqara_fp2_sleep_sleep_state"];
+  return {
+    ...states,
+    "sensor.aqara_fp2_sleep_sleep_state": {
+      ...sleepState,
+      attributes: { measured_at: measuredAt },
+    },
+  };
+}
+
+{
+  const measured = render(
+    withMeasuredAt(
+      defaultStates({ sleepState: "4", updated: "2026-07-03T08:00:30.000Z" }),
+      "2026-07-03T07:55:40+00:00"
+    )
+  );
+  assert.match(measured, /Measured 5 min ago/, "a fresh poll names Aqara's measurement age");
+  assert.doesNotMatch(measured, /Updated 10 sec ago/, "the poll time no longer reads as the measurement time");
+  assert.match(measured, />54\s*<span class="sr-unit">bpm<\/span>/, "a fresh poll still shows vitals");
+
+  const future = render(
+    withMeasuredAt(
+      defaultStates({ sleepState: "4", updated: "2026-07-03T08:00:30.000Z" }),
+      "2026-07-03T08:01:40+00:00"
+    )
+  );
+  assert.match(future, /Measured just now/, "a measurement time slightly ahead of the browser clock reads as now");
+
+  const staleFeed = render(
+    withMeasuredAt(
+      defaultStates({ sleepState: "4", updated: "2026-07-03T07:50:00.000Z" }),
+      "2026-07-03T07:49:00+00:00"
+    )
+  );
+  assert.match(staleFeed, /Stale 10 min ago/, "a stale poller keeps the stale label");
+  assert.doesNotMatch(staleFeed, /Measured/, "a stale poller does not present a measurement age");
+  assertValuesHidden(staleFeed, ["54", "11"], "a stale poller still hides vitals with measured_at present");
+
+  const unparseable = render(
+    withMeasuredAt(
+      defaultStates({ sleepState: "4", updated: "2026-07-03T08:00:30.000Z" }),
+      "not a time"
+    )
+  );
+  assert.match(unparseable, /Updated 10 sec ago/, "an unusable measured_at falls back to the poll time");
+
+  const card = new Card();
+  card.setConfig({});
+  const base = defaultStates({ sleepState: "4", updated: "2026-07-03T08:00:30.000Z" });
+  card.hass = { states: withMeasuredAt(base, "2026-07-03T07:55:40+00:00") };
+  const writes = card.shadowRoot.writes;
+  card.hass = { states: withMeasuredAt(base, "2026-07-03T07:58:40+00:00") };
+  assert.equal(card.shadowRoot.writes, writes + 1, "a new measured_at re-renders the card");
+  assert.match(card.shadowRoot.innerHTML, /Measured 2 min ago/);
+}
