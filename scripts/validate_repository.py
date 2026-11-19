@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -3604,6 +3605,92 @@ def check_night_totals() -> None:
         fail(f"unexpected night total entity ids: {sorted(ids)}")
 
 
+def check_fp2_firmware() -> None:
+    """The device shows the FP2's own firmware, read once from Aqara's device
+    details, and the origin shows SleepRadar's version from the image."""
+    previous = os.environ.get("SLEEPRADAR_VERSION")
+    os.environ["SLEEPRADAR_VERSION"] = "9.8.7"
+    try:
+        module = load_poller_module("poller_fp2_firmware")
+    finally:
+        if previous is None:
+            os.environ.pop("SLEEPRADAR_VERSION", None)
+        else:
+            os.environ["SLEEPRADAR_VERSION"] = previous
+    if module.ORIGIN.get("sw") != "9.8.7":
+        fail(f"the origin must carry SleepRadar's version from the image: {module.ORIGIN}")
+    if "sw_version" in module.DEVICE:
+        fail("the device must not claim a firmware before Aqara reports one")
+    if load_poller_module("poller_fp2_firmware_unset").ORIGIN.get("sw") in (None, "", "1.0.0"):
+        fail("without a baked-in version the origin must say so, not 1.0.0")
+
+    # The request: GET with dids, signed without the query string first; an
+    # "Invalid sign" reply is retried with the query signed.
+    client = module.Aqara("USA")
+    client.token = "t"
+    sent = []
+
+    def fake_send(req):
+        sent.append(req)
+        return {"code": 106, "message": "Invalid sign"} if len(sent) == 1 else {"code": 0, "result": []}
+
+    client._send = fake_send
+    client.device_detail("lumi1.0123456789ab")
+    if len(sent) != 2 or any(r.get_method() != "GET" for r in sent):
+        fail(f"device_detail must GET, retrying once on Invalid sign: {[r.get_method() for r in sent]}")
+    url = client.cfg["server"] + module.DEVICE_DETAIL_PATH + "?dids=lumi1.0123456789ab"
+    if any(r.full_url != url for r in sent):
+        fail(f"device_detail URL: {[r.full_url for r in sent]}")
+    for req, signed_query in zip(sent, (False, True)):
+        h = {k.lower(): v for k, v in req.header_items()}
+        parts = [f"Appid={h['appid']}", f"Nonce={h['nonce']}", f"Time={h['time']}", "Token=t"]
+        if signed_query:
+            parts.append("dids=lumi1.0123456789ab")
+        parts.append(client.cfg["appkey"])
+        if h["sign"] != module.md5("&".join(parts)):
+            fail(f"device_detail signature (query signed: {signed_query}) does not match")
+
+    # Reading the reply.
+    did = "lumi1.0123456789ab"
+    for res, want_fw, want_in_fields in (
+        ({"code": 0, "result": [{"did": "other", "firmwareVersion": "0.1"},
+                                {"did": did, "firmwareVersion": "1.3.0_0002.0092", "model": "x"}]},
+         "1.3.0_0002.0092", "firmwareVersion"),
+        ({"code": 0, "result": {"data": [{"subjectId": did, "firmware_version": "2.0"}]}}, "2.0", "subjectId"),
+        ({"code": 0, "result": [{"did": did, "model": "lumi.motion.agl001"}]}, None, "model"),
+        ({"code": 0, "result": "x"}, None, "unreadable"),
+        ({"code": 755, "message": "m"}, None, "Aqara code 755"),
+    ):
+        fw, fields = module.firmware_from_detail(res, did)
+        if fw != want_fw or want_in_fields not in fields or did in fields:
+            fail(f"firmware_from_detail({res}) = {fw!r}, {fields!r}")
+
+    # Applying it: set once, republish discovery only when it changes.
+    published, logged = [], []
+    module.publish_discovery = lambda client: published.append(dict(module.DEVICE))
+    module.log = lambda level, msg: logged.append((level, msg))
+    module.SUBJECT = did
+
+    class WithFirmware:
+        def device_detail(self, subject):
+            return {"code": 0, "result": [{"did": subject, "firmwareVersion": "1.3.0_0002.0092"}]}
+
+    class Raising:
+        def device_detail(self, subject):
+            raise OSError("reset")
+
+    module.read_fp2_firmware(WithFirmware(), None)
+    module.read_fp2_firmware(WithFirmware(), None)
+    module.read_fp2_firmware(Raising(), None)
+    module.read_fp2_firmware(object(), None)
+    if module.DEVICE.get("sw_version") != "1.3.0_0002.0092" or len(published) != 1:
+        fail(f"the firmware must be set once and republished once: {module.DEVICE} {len(published)}")
+    if not any("FP2 firmware: 1.3.0_0002.0092" in msg for _, msg in logged):
+        fail(f"the firmware must be logged: {logged}")
+    if not any("not read" in msg and "reset" in msg for _, msg in logged):
+        fail(f"a failed firmware read must be logged, not raised: {logged}")
+
+
 def check_notification_failure_is_soft() -> None:
     """Losing a notification must never take the poller down."""
     module = load_poller_module("poller_notify_soft")
@@ -5421,6 +5508,7 @@ def main(argv: list[str] | None = None) -> None:
     check_measurement_time_and_device_status()
     check_history_check()
     check_night_totals()
+    check_fp2_firmware()
     check_notification_failure_is_soft()
     validate_run_script()
     validate_examples()

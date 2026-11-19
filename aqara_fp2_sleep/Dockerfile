@@ -1,6 +1,8 @@
 FROM ghcr.io/home-assistant/base-python:3.13-alpine3.21
 
-ARG BUILD_VERSION=1.2.1
+ARG BUILD_VERSION=dev
+# The poller reports this as SleepRadar's version (the MQTT origin).
+ENV SLEEPRADAR_VERSION=${BUILD_VERSION}
 
 COPY requirements.txt /requirements.txt
 

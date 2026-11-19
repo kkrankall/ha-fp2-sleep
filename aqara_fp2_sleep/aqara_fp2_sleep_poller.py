@@ -11,6 +11,7 @@ import signal
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -243,14 +244,22 @@ PROBLEM_OBJECT_ID = f"{NODE}_connection_problem"
 NOTIFICATION_ID = f"{NODE}_connection_problem"
 MODE_OBJECT_ID = f"{NODE}_fp2_mode"
 ONLINE_OBJECT_ID = f"{NODE}_fp2_online"
+# SleepRadar's own version, baked into the image by the Dockerfile from the
+# Supervisor's BUILD_VERSION build argument.
+APP_VERSION = os.environ.get("SLEEPRADAR_VERSION", "").strip() or "unknown"
+# The device's sw_version is the FP2's own firmware, filled in from Aqara
+# after the first good poll (see FP2_FIRMWARE_FIELDS); Home Assistant shows it
+# as the device's firmware. SleepRadar's version goes in the origin, which
+# Home Assistant shows as "MQTT … via SleepRadar <version>".
 DEVICE = {
     "identifiers": [f"aqara_fp2_sleep_{NODE}"],
     "name": DEVICE_NAME or "Aqara FP2 Sleep Monitor",
     "manufacturer": "Aqara",
     "model": "FP2 (Sleep Monitor)",
-    "sw_version": "aqara_fp2_sleep 1.0.0",
 }
-ORIGIN = {"name": "SleepRadar", "sw": "1.0.0"}
+ORIGIN = {"name": "SleepRadar", "sw": APP_VERSION}
+DEVICE_DETAIL_PATH = "/app/v1.0/lumi/dev/query/detail"
+FP2_FIRMWARE_FIELDS = ("firmwareVersion", "firmware_version", "fwVersion", "firmware")
 EXPIRE_AFTER = max(180, INTERVAL * 3)
 
 SENSORS = [
@@ -367,6 +376,29 @@ class Aqara:
             headers=headers,
             method="POST",
         )
+        return self._send(req)
+
+    def _get(self, path, query, sign_query):
+        """GET `path?query`. The app signs some GETs without the query
+        string and some with it, so `sign_query` picks which."""
+        headers = self._headers(query if sign_query else None)
+        req = urllib.request.Request(
+            f"{self.cfg['server']}{path}?{query}", headers=headers, method="GET"
+        )
+        return self._send(req)
+
+    def device_detail(self, did):
+        """The device's details (model, firmware, ...) as the Aqara Home app
+        reads them. Signed like the AqaraPOST flow (no query string in the
+        signature); an "Invalid sign" reply is retried with the query signed."""
+        query = urllib.parse.urlencode({"dids": did})
+        res = self._get(DEVICE_DETAIL_PATH, query, sign_query=False)
+        if res.get("code") == AQARA_CODE_INVALID_SIGN:
+            res = self._get(DEVICE_DETAIL_PATH, query, sign_query=True)
+        return res
+
+    def _send(self, req):
+        """Send a request; every failure comes back as a reply dict."""
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 body = json.loads(resp.read().decode())
@@ -750,6 +782,48 @@ def has_session(aqara):
     """Whether the client holds a session token. A test double without a
     `token` attribute counts as signed in."""
     return bool(getattr(aqara, "token", True))
+
+
+def firmware_from_detail(res, did):
+    """(firmware, field names) from a device-detail reply. firmware is plain
+    text or None; the field names (never values) are for the log."""
+    if res.get("code") != 0:
+        return None, f"Aqara code {code_text(res.get('code'))}: {aqara_error_text(res)}"
+    result = res.get("result")
+    if isinstance(result, dict):
+        result = result.get("data", [result])
+    if not isinstance(result, list):
+        return None, f"unreadable reply (result is a {type(result).__name__})"
+    devices = [item for item in result if isinstance(item, dict)]
+    mine = [d for d in devices if d.get("did", d.get("subjectId", did)) == did] or devices[:1]
+    if not mine:
+        return None, "no device in the reply"
+    fields = ", ".join(sorted(plain_text(key)[:30] for key in mine[0]))
+    for name in FP2_FIRMWARE_FIELDS:
+        value = mine[0].get(name)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
+            return plain_text(value)[:40], fields
+    return None, fields
+
+
+def read_fp2_firmware(aqara, client):
+    """Ask Aqara for the FP2's firmware once, show it as the device's
+    firmware in Home Assistant, and log it. Never raises."""
+    device_detail = getattr(aqara, "device_detail", None)
+    if device_detail is None:
+        return
+    try:
+        firmware, fields = firmware_from_detail(device_detail(SUBJECT), SUBJECT)
+    except Exception as err:  # noqa: BLE001 - firmware is cosmetic
+        log("info", f"FP2 firmware not read: {type(err).__name__}: {err}")
+        return
+    if firmware is None:
+        log("info", f"FP2 firmware not found in Aqara's device details ({fields})")
+        return
+    log("info", f"FP2 firmware: {firmware}")
+    if DEVICE.get("sw_version") != firmware:
+        DEVICE["sw_version"] = firmware
+        publish_discovery(client)
 
 
 def night_start(now):
@@ -1642,6 +1716,7 @@ def main():
             log("debug", f"state={state}")
             if not history_checked:
                 history_checked = True
+                read_fp2_firmware(aqara, client)
                 run_history_check(aqara)
 
         if ok:
